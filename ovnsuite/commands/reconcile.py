@@ -550,6 +550,27 @@ def _install_nm_profile(ctx: Ctx) -> int:
                 "ovnctl setup --only host-interface")
         return 1
 
+    # Order matters here. NetworkManager's answer to "what type is this
+    # device" is not dependable while the device is unmanaged, and the
+    # answer decides what gets written -- so the managed flag has to go
+    # down and be picked up before anything is generated.
+    if not ctx.dry_run:
+        try:
+            NM_CONF_D.mkdir(parents=True, exist_ok=True)
+            NM_MANAGED_CONF.write_text(
+                NM_MANAGED_TEMPLATE.format(iface=setup.host_if),
+                encoding="utf-8")
+            os.chmod(NM_MANAGED_CONF, 0o644)
+        except OSError as exc:
+            ctx.err(f"Could not write {NM_MANAGED_CONF}: {exc}")
+            return 1
+        ctx.say(f"Wrote {NM_MANAGED_CONF} (keeps {setup.host_if} managed "
+                "across reboots)")
+        # conf.d is read at startup and on reload; `nmcli connection
+        # reload` only rescans keyfiles and will not pick this up.
+        ctx.run("systemctl", "reload", "NetworkManager")
+        ctx.run("nmcli", "device", "set", setup.host_if, "managed", "yes")
+
     # The profile type has to match what NM believes the device is, so
     # this has to happen before the file is generated rather than as a
     # post-hoc check on an already-written keyfile.
@@ -589,16 +610,19 @@ def _install_nm_profile(ctx: Ctx) -> int:
 
     ctx.dr_head("NetworkManager profile")
     if ctx.dry_run:
-        print(f"cat > {path} <<'EOF'")
-        print(content, end="")
-        print("EOF")
-        print(f"chmod 600 {path}")
+        # Shown in the order they are really run: the managed flag and the
+        # reload come first, because the device type they reveal decides
+        # what goes into the keyfile.
         print(f"cat > {NM_MANAGED_CONF} <<'EOF'")
         print(NM_MANAGED_TEMPLATE.format(iface=setup.host_if), end="")
         print("EOF")
         print("systemctl reload NetworkManager")
-        print("nmcli connection reload")
         print(f"nmcli device set {setup.host_if} managed yes")
+        print(f"cat > {path} <<'EOF'")
+        print(content, end="")
+        print("EOF")
+        print(f"chmod 600 {path}")
+        print("nmcli connection reload")
         print(f"nmcli connection up {setup.host_if}")
         return 0
 
@@ -608,10 +632,6 @@ def _install_nm_profile(ctx: Ctx) -> int:
         # NetworkManager silently ignores a keyfile that is readable by
         # anyone but root.
         os.chmod(path, 0o600)
-        NM_CONF_D.mkdir(parents=True, exist_ok=True)
-        NM_MANAGED_CONF.write_text(
-            NM_MANAGED_TEMPLATE.format(iface=setup.host_if), encoding="utf-8")
-        os.chmod(NM_MANAGED_CONF, 0o644)
     except OSError as exc:
         ctx.err(f"Could not write {path}: {exc}")
         return 1
@@ -621,12 +641,6 @@ def _install_nm_profile(ctx: Ctx) -> int:
     for net in setup.host_routes:
         if net.strip():
             ctx.say(f"  route    {net} via {setup.host_gw}")
-    ctx.say(f"Wrote {NM_MANAGED_CONF} (keeps {setup.host_if} managed across "
-            "reboots)")
-
-    # The conf.d snippet is read at startup and on reload, not on the
-    # `nmcli connection reload` below -- that one only rescans keyfiles.
-    ctx.run("systemctl", "reload", "NetworkManager")
 
     if not ctx.run("nmcli", "connection", "reload"):
         ctx.warn("nmcli connection reload failed; the profile is on disk but "
