@@ -107,6 +107,16 @@ def register(subparsers) -> argparse.ArgumentParser:
     return p
 
 
+def _short(ref: str, keep: int = 8) -> str:
+    """A port reference short enough for a status line.
+
+    user_vm and vm_attach both name logical ports after a UUID, so the
+    full string is 36 characters of noise in a column that has 46 to
+    spend on everything.
+    """
+    return ref if len(ref) <= keep + 3 else ref[:keep] + "..."
+
+
 class ACLManager:
     def __init__(self, ctx: Ctx):
         self.ctx = ctx
@@ -874,7 +884,7 @@ class ACLManager:
         if explicit:
             local = ports.get(explicit)
             if local is None:
-                return [], f"port {explicit[:12]}... is not a VIF in the db"
+                return [], f'port "{_short(explicit)}" is not a VIF in the db'
             locals_ = [local]
         else:
             members = [ports[m] for m in self._members_of(group) if m in ports]
@@ -898,6 +908,18 @@ class ACLManager:
             if peer is None:
                 return [], "unconstrained match with no peer to trace from"
             peers = [peer["ip"]]
+
+        # Check the endpoint here rather than letting _trace_expr find it,
+        # so the message can name the port. "port has no MAC, address" sends
+        # you looking through fifty ACLs; the port id sends you straight to
+        # `ovn-nbctl list Logical_Switch_Port <id>`.
+        lacking = [(p, [n for n, v in (("MAC", p["mac"]), ("address", p["ip"]),
+                                       ("switch", p["switch"])) if not v])
+                   for p in locals_]
+        if all(miss for _p, miss in lacking):
+            port, miss = lacking[0]
+            return [], (f'port "{_short(port["name"])}" has no '
+                        f'{", ".join(miss)}')
 
         protos: list[tuple[str, str]] = []
         for proto, blob in self._M_L4.findall(match):
@@ -948,7 +970,8 @@ class ACLManager:
                 for uuid in self._ovsdb_set(row[1]):
                     owner[uuid] = row[0]
 
-        print(f"  {self.c.bold}--- deployed ACLs not declared in [acls].rules ---{self.c.rst}")
+        print(f"  {self.c.bold}--- deployed ACLs not declared in "
+              f"[acls].rules ---{self.c.rst}")
         ports, by_ip = self._db_ports()
         lrp_mac = self._switch_lrp_mac()
 
@@ -983,7 +1006,55 @@ class ACLManager:
                                 trace_acl_priorities(out, side),
                                 trace_acl_priorities(out), out))
             self._report_case(label, want_prio, results, direction)
+
+        self._report_duplicate_acls(pending, ports)
         print("")
+
+    def _report_duplicate_acls(self, acls: list, ports: dict) -> None:
+        """Two ACLs with one name is not a cosmetic problem.
+
+        The deployer uses `acl-add --may-exist`, which is keyed on
+        direction, priority and MATCH -- so editing a match does not
+        replace the old ACL, it adds a second one beside it. Both are
+        enforced, and the older one is invisible to every command that
+        looks the rule up by name.
+
+        Each copy gets probed on its own above, which is how one can pass
+        while its twin reports an addressless port. Read on its own that
+        looks like a bug in the checker; named here, it is the leftover
+        it actually is.
+        """
+        c = self.c
+        seen: dict[str, list] = {}
+        for row in acls:
+            name = " ".join(self._ovsdb_set(row[1]))
+            if name:
+                seen.setdefault(name, []).append(row)
+        dupes = {n: rows for n, rows in seen.items() if len(rows) > 1}
+        if not dupes:
+            return
+
+        self.v_warn += len(dupes)
+        for name in sorted(dupes):
+            rows = dupes[name]
+            print(f"  {self.tag('warn')} {name:<46} "
+                  f"{len(rows)} ACLs share this name")
+            for row in rows:
+                scope = self._M_SCOPE.search(row[5] or "")
+                ref = (scope.group(3) or f"@{scope.group(2)}") if scope else "?"
+                port = ports.get(ref)
+                if port is None:
+                    detail = "port not in the db"
+                elif not (port["mac"] and port["ip"]):
+                    detail = f"{c.ylw}port has no addresses{c.rst}"
+                else:
+                    detail = f"{port['ip']} on {port['switch']}"
+                print(f"         {c.dim}{row[2]} {row[3]} -> "
+                      f'"{_short(ref)}"{c.rst}  {detail}')
+            print(f"         {c.dim}acl-add --may-exist adds a second ACL "
+                  f"when a match changes rather than{c.rst}")
+            print(f"         {c.dim}replacing it. Both are enforced. "
+                  f"-> ovnctl acl --audit{c.rst}")
 
     def _verify_every_rule(self, lrp_int_mac: str, lrp_ext_mac: str) -> None:
         rules = [r for r in self.parsed_rules() if not r.error]
