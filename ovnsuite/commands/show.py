@@ -448,9 +448,24 @@ _ASCII_ART = str.maketrans({
     "►": ">", "◄": "<", "·": "-", "▪": "*", "–": "-", "—": "-",
 })
 
-#: Inner width of a top-tier box, and the overall width of the drawing.
-_BOX = 18
-_ART_W = 75
+# Geometry. Every box in the drawing is _CELL wide with its connector
+# tick at _TICK, which is what lets the four segment columns, the centre
+# stack and the router bar line up without a single hand-typed run of
+# padding. Change _CELL or _GAP and the whole drawing re-flows; nothing
+# below re-states a column position as a literal.
+_MARGIN = 4
+_CELL = 24
+_INNER = _CELL - 2
+_GAP = 4
+_N_COL = 4
+_TICK = 11                                        # tick offset within a cell
+_BAR = _N_COL * _CELL + (_N_COL - 1) * _GAP       # width of the lr-core bar
+_ART_W = _MARGIN * 2 + _BAR
+_CX = _MARGIN + (_BAR - _CELL) // 2               # centred single-box stack
+_WGAP = _CX - (_MARGIN + _CELL)                   # world-tier connectors
+#: Column origins, and the tick offsets they need on the bar's bottom edge.
+_COL_X = tuple(_MARGIN + i * (_CELL + _GAP) for i in range(_N_COL))
+_BAR_TICKS = tuple(x - _MARGIN + _TICK for x in _COL_X)
 
 
 def _art_ascii_only() -> bool:
@@ -517,8 +532,12 @@ class _Art:
         self.lines.append("".join(parts))
 
     def emit(self) -> None:
+        # rstrip because the connector rows are a tick plus the rest of
+        # the cell's width, and a file full of trailing whitespace is a
+        # file that fails everyone's linter and diffs badly.
         for line in self.lines:
-            print(line.translate(_ASCII_ART) if self.ascii_only else line)
+            out = line.translate(_ASCII_ART) if self.ascii_only else line
+            print(out.rstrip())
 
 
 def show_topology() -> None:
@@ -527,8 +546,15 @@ def show_topology() -> None:
     Drawn from the CONFIG, annotated from the DB. Those are two different
     sources and the difference is the point: the boxes are what the
     settings file says should exist, and anything the northbound db does
-    not actually have gets flagged rather than quietly drawn as if it
-    were there.
+    not actually have gets named in a footnote rather than quietly drawn
+    as if it were there.
+
+    Every segment gets its own column with its own line up into lr-core.
+    An earlier version hung all four off one shared spine, which is the
+    same topology and half the width, but it reads as though the switches
+    are strung together on a bus rather than each being its own router
+    port -- and that is exactly the thing this picture exists to make
+    obvious.
     """
     print("\n" + "=" * _ART_W)
     print(" SHOW TOPOLOGY (logical view, from ovn-settings.yaml)")
@@ -566,84 +592,104 @@ def show_topology() -> None:
     transit_ip = g("localnet_internal", "transit_ip", "?")
     lr_core = g("topology", "lr_core", "lr-core")
 
-    present = _nb_names("Logical_Switch")
+    switches = _nb_names("Logical_Switch")
     routers = _nb_names("Logical_Router")
+    missing: list[str] = []
 
-    def mark(name: str, names: set[str] | None) -> str:
-        """Trailing annotation for something the db does not have."""
-        if names is None or name in names:
-            return ""
-        return f"   {DIM}(not in NB db){RST}"
+    def check(name: str, names: set[str] | None) -> None:
+        """Record anything the config declares but the db does not have.
 
-    def stem(colour: str) -> None:
-        """One connector row between two stacked boxes.
-
-        Column 38 is the centre of the upper stack. Every junction in the
-        drawing gets exactly one of these -- including the segment boxes
-        further down, which sit a row apart for the same reason. A stack
-        where some joins are tighter than others reads as though the
-        tight ones are more closely related, which is not what the
-        spacing is meant to say.
+        Collected rather than printed beside the box: with four columns
+        there is no clear space to the right of one, and a marker wedged
+        into a cell would either overflow it or shift the column. One
+        footnote naming all of them is also the more useful shape -- it
+        is a list you can act on rather than a mark you have to hunt for.
         """
-        art.add(" " * 38, art.cell("│", colour))
+        if names is not None and name not in names:
+            missing.append(name)
 
-    # --- the world outside OVN ---------------------------------------
-    top = art.cell("┌" + "─" * _BOX + "┐", OUT)
-    art.add("   ", top, "      ", top, "      ", top)
-    art.add("   ",
-            art.cell("│", OUT), art.cell("workstation LAN", OUT, _BOX),
-            art.cell("│", OUT), art.cell("◄─────", OUT),
-            art.cell("│", OUT), art.cell("ASA firewall", OUT, _BOX),
-            art.cell("│", OUT), art.cell("─────►", OUT),
-            art.cell("│", OUT), art.cell("client targets", OUT, _BOX),
-            art.cell("│", OUT))
-    art.add("   ",
-            art.cell("│", OUT), art.cell(ws_subnet, OUT, _BOX),
-            art.cell("│", OUT), "      ",
-            art.cell("│", OUT), art.cell(lan_gw, OUT, _BOX),
-            art.cell("│", OUT), "      ",
-            art.cell("│", OUT), art.cell("via default route", OUT, _BOX),
-            art.cell("│", OUT))
-    art.add("   ", art.cell("└" + "─" * _BOX + "┘", OUT), "      ",
-            art.cell("└────────┬─────────┘", OUT), "      ",
-            art.cell("└" + "─" * _BOX + "┘", OUT))
-    stem(OUT)
+    # -- cell primitives ----------------------------------------------
+    # Every box in the drawing is _CELL wide with its connector tick at
+    # the same offset, which is what lets the four columns, the centre
+    # stack and the router bar all line up without a single hand-typed
+    # run of padding.
+    def rule(left: str, right: str, ticks, tick_ch: str,
+             width: int = _CELL) -> str:
+        chars = ["─"] * width
+        chars[0], chars[-1] = left, right
+        for t in ticks:
+            chars[t] = tick_ch
+        return "".join(chars)
 
-    # --- the single physical uplink ----------------------------------
-    art.add(" " * 29, art.cell("┌────────┴─────────┐", OUT))
-    art.add(" " * 29, art.cell("│", OUT),
-            art.cell(br_internal, OUT, _BOX), art.cell("│", OUT),
-            f"   {DIM}{phys_nic} · {physnet}{RST}")
-    art.add(" " * 29, art.cell("└────────┬─────────┘", OUT))
-    stem(LOG)
-    art.add(" " * 29, art.cell("┌────────┴─────────┐", LOG))
-    art.add(" " * 29, art.cell("│", LOG),
-            art.cell(ls_uplink, LOG, _BOX), art.cell("│", LOG),
-            f"   {DIM}{ln_uplink} (localnet){RST}", mark(ls_uplink, present))
-    art.add(" " * 29, art.cell("│", LOG),
-            art.cell(transit_net, LOG, _BOX), art.cell("│", LOG))
-    art.add(" " * 29, art.cell("└────────┬─────────┘", LOG))
-    stem(LOG)
+    def c_top(colour: str, tick: bool = True) -> str:
+        return art.cell(rule("┌", "┐", (_TICK,) if tick else (), "┴"), colour)
 
-    # --- the router ---------------------------------------------------
-    bar = _ART_W - 3            # 72 columns of bar
-    inner = bar - 4             # "│ " + content + " │"
-    art.add("   ", art.cell("┌" + "─" * 34 + "┴" + "─" * 35 + "┐", LOG))
-    art.add("   ", art.cell("│ ", LOG),
+    def c_bot(colour: str, tick: bool = False) -> str:
+        return art.cell(rule("└", "┘", (_TICK,) if tick else (), "┬"), colour)
+
+    def c_txt(text: str, colour: str, tcol: str = "") -> str:
+        return (art.cell("│", colour)
+                + art.cell(text, tcol or colour, _INNER)
+                + art.cell("│", colour))
+
+    def c_stem(colour: str) -> str:
+        return (" " * _TICK + art.cell("│", colour)
+                + " " * (_CELL - _TICK - 1))
+
+    def row(*cells: str) -> None:
+        art.add(" " * _MARGIN + (" " * _GAP).join(cells))
+
+    def mid(cell: str) -> None:
+        art.add(" " * _CX + cell)
+
+    def trio(a: str, b: str, cc: str, link_l: str = "", link_r: str = "") -> None:
+        art.add(" " * _MARGIN, a, link_l or " " * _WGAP,
+                b, link_r or " " * _WGAP, cc)
+
+    # -- the world outside OVN ----------------------------------------
+    trio(c_top(OUT, False), c_top(OUT, False), c_top(OUT, False))
+    trio(c_txt("workstation LAN", OUT), c_txt("ASA firewall", OUT),
+         c_txt("client targets", OUT),
+         art.cell("◄" + "─" * (_WGAP - 1), OUT),
+         art.cell("─" * (_WGAP - 1) + "►", OUT))
+    trio(c_txt(ws_subnet, OUT), c_txt(lan_gw, OUT),
+         c_txt("via default route", OUT))
+    trio(c_bot(OUT, False), c_bot(OUT, tick=True), c_bot(OUT, False))
+    mid(c_stem(OUT))
+
+    # -- the single physical uplink -----------------------------------
+    mid(c_top(OUT))
+    mid(c_txt(br_internal, OUT))
+    mid(c_txt(f"{phys_nic} · {physnet}", OUT, DIM))
+    mid(c_bot(OUT, tick=True))
+    mid(c_stem(LOG))
+
+    mid(c_top(LOG))
+    mid(c_txt(ls_uplink, LOG))
+    mid(c_txt(f"{ln_uplink} (localnet)", LOG, DIM))
+    mid(c_txt(transit_net, LOG, DIM))
+    mid(c_bot(LOG, tick=True))
+    check(ls_uplink, switches)
+    mid(c_stem(LOG))
+
+    # -- the router ----------------------------------------------------
+    # One tick per column on the bottom edge, so each logical switch has
+    # its own visible line into lr-core.
+    inner = _BAR - 4
+    art.add(" " * _MARGIN,
+            art.cell(rule("┌", "┐", (_CX + _TICK - _MARGIN,), "┴", _BAR), LOG))
+    art.add(" " * _MARGIN, art.cell("│ ", LOG),
             f"{col.bold}{lr_core.ljust(inner)[:inner]}{RST}",
-            art.cell(" │", LOG), mark(lr_core, routers))
+            art.cell(" │", LOG))
     detail = (f"lrp-uplink {transit_ip} · default 0.0.0.0/0 via {lan_gw} "
               f"· no NAT")
-    art.add("   ", art.cell("│ ", LOG),
+    art.add(" " * _MARGIN, art.cell("│ ", LOG),
             art.cell(detail, LOG, inner, "left"), art.cell(" │", LOG))
-    art.add("   ", art.cell("└──┬" + "─" * (bar - 5) + "┘", LOG))
-    art.add(" " * 6, art.cell("│", LOG))
+    art.add(" " * _MARGIN,
+            art.cell(rule("└", "┘", _BAR_TICKS, "┬", _BAR), LOG))
+    check(lr_core, routers)
 
-    # --- the segments hanging off it ----------------------------------
-    # Counts come from the inventory and the allocation file rather than
-    # from the picture's own idea of how many VMs there are -- a number
-    # typed into the art is a number that goes stale the first time
-    # somebody adds a VM to [vm_config] and does not think to look here.
+    # -- the four segments, one column each ---------------------------
     try:
         inv = Inventory(cfg)
     except Abort:
@@ -653,17 +699,16 @@ def show_topology() -> None:
     used = len(user_vm_slots())
     n_slots = g("user_vms", "slots", "10")
     prefix = g("user_vms", "name_prefix", "user-vm")
-    lrp_host_cidr = g("setup", "lrp_host_cidr", "?")
     lrp_int_cidr = g("setup", "lrp_int_cidr", "?")
     lrp_ext_cidr = g("setup", "lrp_ext_cidr", "?")
 
     def span(vms: list) -> str:
-        """"first - last" for a group, or something honest if it is empty."""
+        """"first – last" for a group, or something honest if it is empty."""
         if not vms:
             return "none configured"
         if len(vms) == 1:
             return vms[0].name
-        return f"{vms[0].name} \u2013 {vms[-1].name}"
+        return f"{vms[0].name} – {vms[-1].name}"
 
     def network_of(cidr: str) -> str:
         """The SUBNET a router port sits on, not the port's own address.
@@ -678,12 +723,12 @@ def show_topology() -> None:
         except ValueError:
             return "?"
 
-    segments = [
+    columns = [
         (g("topology", "ls_host", "ls-host"),
-         g("setup", "lrp_host", "lrp-host"), lrp_host_cidr,
-         ["host-if",
-          g("setup", "host_if_ip", "?"),
-          "OVS internal port on br-int"], TRU),
+         g("setup", "lrp_host", "lrp-host"),
+         g("setup", "lrp_host_cidr", "?"),
+         ["host-if", g("setup", "host_if_ip", "?"), "OVS internal port"],
+         TRU),
         (g("topology", "ls_int", "ls-int-vm"),
          g("setup", "lrp_int", "lrp-int-vm"), lrp_int_cidr,
          [span(inv.internal if inv else []),
@@ -698,61 +743,30 @@ def show_topology() -> None:
          g("user_vms", "lrp", "lrp-user-vm"),
          f"{g('user_vms', 'gateway', '?')}/"
          f"{g('user_vms', 'subnet', '?/?').split('/')[-1]}",
-         [f"{prefix}1 \u2013 {prefix}{n_slots} (dynamic)",
-          f"{used}/{n_slots} slots allocated",
+         [f"{prefix}1 – {prefix}{n_slots}",
+          f"{used}/{n_slots} slots (dynamic)",
           g("user_vms", "pg_name", "pg_user_vms")], ISO),
     ]
 
-    # Two columns of boxes, mirroring the documentation diagram: the
-    # logical switch and its router port on the left, what is actually
-    # attached to it on the right. Column geometry is derived from the
-    # widths rather than typed as literal padding, so a wider box does
-    # not silently shear the arrow column out of alignment.
-    SW_W, MEM_W = 24, 37          # outer widths
-    sw_in, mem_in = SW_W - 2, MEM_W - 2
-    gap_l, gap_r = " ", " "       # around the "──►" between the columns
+    tiers = [c[4] for c in columns]
+    row(*(c_stem(LOG) for _ in columns))
+    row(*(c_top(LOG) for _ in columns))
+    for r in range(3):
+        row(*(c_txt([sw, lrp, f"gw {cidr}"][r], LOG, LOG if r == 0 else DIM)
+              for sw, lrp, cidr, _, _ in columns))
+    row(*(c_bot(LOG, tick=True) for _ in columns))
 
-    for i, (name, lrp, cidr, members, tier) in enumerate(segments):
-        last = i == len(segments) - 1
-        left = [name, lrp, f"gw {cidr}"]
+    row(*(c_stem(t) for t in tiers))
+    row(*(c_top(t) for t in tiers))
+    for r in range(3):
+        row(*(c_txt(members[r], t, t if r == 0 else DIM)
+              for _, _, _, members, t in columns))
+    row(*(c_bot(t) for t in tiers))
 
-        def trunk(row: int) -> str:
-            """Column 6: the spine coming down from lr-core.
+    for sw, _, _, _, _ in columns:
+        check(sw, switches)
 
-            It carries on past every segment but the last, where it turns
-            into the elbow and stops -- so the drawing shows four
-            branches off one router port list, not four unrelated boxes
-            that happen to be stacked.
-            """
-            if row == 2:
-                return art.cell(("\u2514" if last else "\u251c")
-                                + "\u2500\u25ba", LOG)
-            if last and row > 2:
-                return "   "
-            return art.cell("\u2502", LOG) + "  "
-
-        def hrule(ch_l: str, ch_r: str) -> None:
-            art.add(" " * 6, trunk(0 if ch_l == "\u250c" else 4),
-                    art.cell(ch_l + "\u2500" * sw_in + ch_r, LOG), " " * 5,
-                    art.cell(ch_l + "\u2500" * mem_in + ch_r, tier))
-
-        hrule("\u250c", "\u2510")
-        for r in range(3):
-            joined = r == 1
-            mid = (gap_l + art.cell("\u2500\u2500\u25ba", LOG) + gap_r
-                   if joined else " " * 5)
-            art.add(" " * 6, trunk(r + 1),
-                    art.cell("\u2502", LOG),
-                    art.cell(left[r], LOG if r == 0 else DIM, sw_in),
-                    art.cell("\u2502", LOG), mid,
-                    art.cell("\u2502", tier),
-                    art.cell(members[r], tier if r == 0 else DIM, mem_in),
-                    art.cell("\u2502", tier),
-                    mark(name, present) if joined else "")
-        hrule("\u2514", "\u2518")
-        if not last:
-            art.add(" " * 6, art.cell("\u2502", LOG))
-
+    # -- legend and footnotes -----------------------------------------
     art.add("")
     art.add(f"  {OUT}▪{RST} outside OVN   {LOG}▪{RST} OVN logical   "
             f"{TRU}▪{RST} trusted   {ISO}▪{RST} isolated by port group")
@@ -762,6 +776,11 @@ def show_topology() -> None:
     if split:
         art.add(f"  {DIM}{split} is additionally forced to the ASA by "
                 f"lr-policy, not by the route table.{RST}")
+    if missing:
+        art.add(f"  {col.ylw}!{RST} declared in the settings file but NOT in "
+                f"the NB db: {', '.join(missing)}")
+        art.add(f"    {DIM}Nothing is enforcing what the box claims. "
+                f"-> ovnctl diagnose{RST}")
     art.emit()
 
 
