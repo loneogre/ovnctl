@@ -597,6 +597,36 @@ def show_topology() -> None:
               if r]
     default_via = next((nh for pfx, nh in static if pfx == "0.0.0.0/0"), "")
 
+    # vm_attach names logical ports after the libvirt domain UUID, so a
+    # port's own name is unreadable in a 22-column box. The vm-name
+    # external-id is the intended answer and costs one query; virsh is
+    # consulted only if some port predates that tagging, and only once.
+    vm_label = get_lsp_vm_name_map()
+    virsh: dict[str, str] = {}
+    unresolved: set[str] = set()
+
+    def label_of(port: dict) -> str:
+        name = port["name"]
+        if name in vm_label:
+            return vm_label[name]
+        nonlocal virsh
+        if not virsh:
+            virsh = build_virsh_vm_map() or {"": ""}
+        for token in port.get("addrs", "").split():
+            hit = virsh.get(token.lower())
+            if hit:
+                return hit
+        # Plain ASCII rather than an ellipsis: the box-drawing fallback
+        # swaps characters one for one, and a 1-to-3 substitution there
+        # would shear every column to the right of it.
+        fallback = name if len(name) <= 16 else name[:11] + "..."
+        unresolved.add(fallback)
+        return fallback
+
+    def natural(text: str) -> list:
+        """Sort user-vm10 after user-vm9, not after user-vm1."""
+        return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", text)]
+
     def ports_of(sw: str) -> list[dict]:
         return [lsp[u] for u in sw_ports.get(sw, []) if u in lsp]
 
@@ -763,11 +793,20 @@ def show_topology() -> None:
 
     # -- the segment columns -------------------------------------------
     def span(names: list[str]) -> str:
+        """A range if it fits, otherwise a head count.
+
+        Truncating "user-vm1 – user-vm10" mid-word to fit the box reads
+        as a corrupted name rather than as an elided list, which is worse
+        than not showing the range at all.
+        """
         if not names:
             return "no ports"
         if len(names) == 1:
             return names[0]
-        return f"{names[0]} – {names[-1]}"
+        ranged = f"{names[0]} – {names[-1]}"
+        if len(ranged) <= _INNER:
+            return ranged
+        return f"{names[0]} + {len(names) - 1} more"
 
     ls_host_n = g("topology", "ls_host", "ls-host")
     ls_ext_n = g("topology", "ls_ext", "ls-ext-vm")
@@ -779,12 +818,14 @@ def show_topology() -> None:
     cols: list[tuple] = []
     for sw in ordered:
         lrp, gw = gw_of(sw)
-        vifs = sorted(p["name"] for p in typed(sw, "vif"))
+        vif_ports = {label_of(p): p for p in typed(sw, "vif")}
+        # Ports whose name could not be resolved sort last, so one
+        # untagged VIF cannot push the readable names out of the span.
+        vifs = sorted(vif_ports, key=lambda x: (x in unresolved, natural(x)))
         tier = TRU if sw in (ls_host_n, g("topology", "ls_int", "ls-int-vm")) \
             else ISO
         if sw == ls_host_n and vifs:
-            info = lsp.get(vifs[0], {})
-            addrs = info.get("addrs", "").split()
+            addrs = vif_ports[vifs[0]].get("addrs", "").split()
             members = [vifs[0], addrs[-1] if addrs else "no address",
                        "OVS internal port"]
         elif sw == ls_user_n:
