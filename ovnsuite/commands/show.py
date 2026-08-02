@@ -25,16 +25,21 @@ import argparse
 import json
 import re
 import subprocess
+import sys
 
-from ..context import Ctx
+from ..config import Config, ConfigError
+from ..context import Abort, Colour, Ctx
+from ..inventory import Inventory, user_vm_slots
 
 NAME = "show"
 HELP = "read-only views of the OVN configuration"
 
-VIEWS = ("chassis", "routers", "switches", "ip-int-br", "interfaces",
-         "route", "policies", "acls")
+VIEWS = ("topology", "chassis", "routers", "switches", "ip-int-br",
+         "interfaces", "route", "policies", "acls")
 
 _ALIASES = {
+    "topology": "topology", "topo": "topology", "map": "topology",
+    "diagram": "topology", "show-topology": "topology",
     "chassis": "chassis", "show-chassis": "chassis",
     "routers": "routers", "router": "routers", "show-routers": "routers",
     "switches": "switches", "switch": "switches", "show-switches": "switches",
@@ -427,6 +432,251 @@ def _vm_domain(p_type: str, name: str, addr_str: str,
         return virsh_vms.get(m.group(0).lower(),
                              vm_name_map.get(name, "Unknown VM"))
     return virsh_vms.get(name, vm_name_map.get(name, "Unknown VIF"))
+
+
+# ---------------------------------------------------------------------------
+# topology picture
+# ---------------------------------------------------------------------------
+# The art is written once, in box-drawing characters, and folded down to
+# ASCII when the terminal cannot encode them. Every replacement is a
+# single-width character, so the column arithmetic below holds either way
+# -- which is the whole reason for doing it as a translation rather than
+# as two separate templates that would drift apart on the first edit.
+_ASCII_ART = str.maketrans({
+    "─": "-", "│": "|", "┌": "+", "┐": "+", "└": "+", "┘": "+",
+    "├": "+", "┤": "+", "┬": "+", "┴": "+", "┼": "+",
+    "►": ">", "◄": "<", "·": "-", "▪": "*",
+})
+
+#: Inner width of a top-tier box, and the overall width of the drawing.
+_BOX = 18
+_ART_W = 75
+
+
+def _art_ascii_only() -> bool:
+    """Can this stream actually encode the box-drawing characters?
+
+    `ovnctl show > topology.txt` under LC_ALL=C gives a latin-1 or ascii
+    stdout, and printing U+250C at it raises UnicodeEncodeError -- which
+    would turn a read-only view into a traceback. Ask the stream rather
+    than guessing from the locale.
+    """
+    enc = getattr(sys.stdout, "encoding", None) or "ascii"
+    try:
+        "┌─┐►".encode(enc)
+    except (UnicodeError, LookupError):
+        return True
+    return False
+
+
+def _nb_names(table: str) -> set[str] | None:
+    """Names present in an NB table, or None if the db could not be read.
+
+    None and set() are different answers and the drawing treats them
+    differently: an empty NB db means "nothing is deployed", while an
+    unreadable one means "no idea" -- and marking every segment ABSENT
+    because ovn-nbctl is not installed would be a confident lie.
+    `rows()` collapses both to [], so discriminate on the raw payload.
+    """
+    payload = nb("name", table)
+    if not payload:
+        return None
+    return {r[0] for r in rows(payload) if r and isinstance(r[0], str)}
+
+
+class _Art:
+    """Fixed-width cell composer.
+
+    Padding happens on the bare text and the colour codes are wrapped
+    around the result, so the escape sequences never enter the width
+    arithmetic. Doing it the other way round -- colouring first, padding
+    after -- is what makes coloured ASCII art shear by nine characters the
+    moment a value changes length.
+    """
+
+    def __init__(self, colour):
+        self.c = colour
+        self.ascii_only = _art_ascii_only()
+        self.lines: list[str] = []
+
+    def cell(self, text: str, colour: str = "", width: int = 0,
+             how: str = "center") -> str:
+        if width:
+            text = text[:width]
+            if how == "center":
+                text = text.center(width)
+            elif how == "left":
+                text = text.ljust(width)
+            else:
+                text = text.rjust(width)
+        if not colour:
+            return text
+        return colour + text + self.c.rst
+
+    def add(self, *parts: str) -> None:
+        self.lines.append("".join(parts))
+
+    def emit(self) -> None:
+        for line in self.lines:
+            print(line.translate(_ASCII_ART) if self.ascii_only else line)
+
+
+def show_topology() -> None:
+    """A picture of the logical topology, drawn from the settings file.
+
+    Drawn from the CONFIG, annotated from the DB. Those are two different
+    sources and the difference is the point: the boxes are what the
+    settings file says should exist, and anything the northbound db does
+    not actually have gets flagged rather than quietly drawn as if it
+    were there.
+    """
+    print("\n" + "=" * _ART_W)
+    print(" SHOW TOPOLOGY (logical view, from ovn-settings.yaml)")
+    print("=" * _ART_W)
+
+    try:
+        cfg = Config().load()
+    except (ConfigError, OSError) as exc:
+        col = Colour()
+        print(f"{col.dim}No settings file, so there is nothing to draw: "
+              f"{exc}{col.rst}")
+        print(f"{col.dim}The views below read the db directly and are "
+              f"unaffected.{col.rst}")
+        return
+
+    col = Colour()
+    art = _Art(col)
+
+    # Trust tiers, matching the documentation diagram: grey is outside
+    # OVN, magenta is OVN's own logical objects, cyan is trusted, yellow
+    # is a segment held down by a port group.
+    OUT, LOG, TRU, ISO = col.gry, col.mag, col.cyan, col.ylw
+    DIM, RST = col.dim, col.rst
+
+    g = lambda s, k, d="": cfg.cfg_opt(s, k, d)  # noqa: E731
+
+    lan_gw = g("localnet_internal", "lan_gateway", "?")
+    ws_subnet = g("localnet_internal", "workstation_subnet", "?")
+    br_internal = g("localnet_internal", "br_internal", "br-internal")
+    phys_nic = g("localnet_internal", "phys_nic", "?")
+    physnet = g("localnet_internal", "physnet_label", "physnet")
+    ls_uplink = g("localnet_internal", "ls_uplink", "ls-uplink")
+    ln_uplink = g("localnet_internal", "ln_uplink", "ln-uplink")
+    transit_net = g("localnet_internal", "transit_subnet", "?")
+    transit_ip = g("localnet_internal", "transit_ip", "?")
+    lr_core = g("topology", "lr_core", "lr-core")
+
+    present = _nb_names("Logical_Switch")
+    routers = _nb_names("Logical_Router")
+
+    def mark(name: str, names: set[str] | None) -> str:
+        """Trailing annotation for something the db does not have."""
+        if names is None or name in names:
+            return ""
+        return f"   {DIM}(not in NB db){RST}"
+
+    # --- the world outside OVN ---------------------------------------
+    top = art.cell("┌" + "─" * _BOX + "┐", OUT)
+    art.add("   ", top, "      ", top, "      ", top)
+    art.add("   ",
+            art.cell("│", OUT), art.cell("workstation LAN", OUT, _BOX),
+            art.cell("│", OUT), art.cell("◄─────", OUT),
+            art.cell("│", OUT), art.cell("ASA firewall", OUT, _BOX),
+            art.cell("│", OUT), art.cell("─────►", OUT),
+            art.cell("│", OUT), art.cell("client targets", OUT, _BOX),
+            art.cell("│", OUT))
+    art.add("   ",
+            art.cell("│", OUT), art.cell(ws_subnet, OUT, _BOX),
+            art.cell("│", OUT), "      ",
+            art.cell("│", OUT), art.cell(lan_gw, OUT, _BOX),
+            art.cell("│", OUT), "      ",
+            art.cell("│", OUT), art.cell("via default route", OUT, _BOX),
+            art.cell("│", OUT))
+    art.add("   ", art.cell("└" + "─" * _BOX + "┘", OUT), "      ",
+            art.cell("└────────┬─────────┘", OUT), "      ",
+            art.cell("└" + "─" * _BOX + "┘", OUT))
+    art.add(" " * 38, art.cell("│", OUT))
+
+    # --- the single physical uplink ----------------------------------
+    art.add(" " * 29, art.cell("┌────────┴─────────┐", OUT))
+    art.add(" " * 29, art.cell("│", OUT),
+            art.cell(br_internal, OUT, _BOX), art.cell("│", OUT),
+            f"   {DIM}{phys_nic} · {physnet}{RST}")
+    art.add(" " * 29, art.cell("└────────┬─────────┘", OUT))
+    art.add(" " * 29, art.cell("┌────────┴─────────┐", LOG))
+    art.add(" " * 29, art.cell("│", LOG),
+            art.cell(ls_uplink, LOG, _BOX), art.cell("│", LOG),
+            f"   {DIM}{ln_uplink} (localnet){RST}", mark(ls_uplink, present))
+    art.add(" " * 29, art.cell("│", LOG),
+            art.cell(transit_net, LOG, _BOX), art.cell("│", LOG))
+    art.add(" " * 29, art.cell("└────────┬─────────┘", LOG))
+
+    # --- the router ---------------------------------------------------
+    bar = _ART_W - 3            # 72 columns of bar
+    inner = bar - 4             # "│ " + content + " │"
+    art.add("   ", art.cell("┌" + "─" * 34 + "┴" + "─" * 35 + "┐", LOG))
+    art.add("   ", art.cell("│ ", LOG),
+            f"{col.bold}{lr_core.ljust(inner)[:inner]}{RST}",
+            art.cell(" │", LOG), mark(lr_core, routers))
+    detail = (f"lrp-uplink {transit_ip} · default 0.0.0.0/0 via {lan_gw} "
+              f"· no NAT")
+    art.add("   ", art.cell("│ ", LOG),
+            art.cell(detail, LOG, inner, "left"), art.cell(" │", LOG))
+    art.add("   ", art.cell("└──┬" + "─" * (bar - 5) + "┘", LOG))
+    art.add(" " * 6, art.cell("│", LOG))
+
+    # --- the segments hanging off it ----------------------------------
+    # Counts come from the inventory and the allocation file rather than
+    # from the picture's own idea of how many VMs there are -- a number
+    # typed into the art is a number that goes stale the first time
+    # somebody adds a VM to [vm_config] and does not think to look here.
+    try:
+        inv = Inventory(cfg)
+    except Abort:
+        inv = None
+
+    n_int = len(inv.internal) if inv else 0
+    n_ext = len(inv.external) if inv else 0
+    n_iso = len(inv.isolated) if inv else 0
+    slots = len(user_vm_slots())
+
+    ls_host = g("topology", "ls_host", "ls-host")
+    ls_int = g("topology", "ls_int", "ls-int-vm")
+    ls_ext = g("topology", "ls_ext", "ls-ext-vm")
+    ls_user = g("user_vms", "switch", "ls-user-vm")
+    n_slots = g("user_vms", "slots", "10")
+
+    segments = [
+        (ls_host, g("setup", "lrp_host_cidr", "?"),
+         f"host-if {g('setup', 'host_if_ip', '?')}", TRU),
+        (ls_int, g("setup", "lrp_int_cidr", "?"),
+         f"{n_int} VMs   int-vm ports", TRU),
+        (ls_ext, g("setup", "lrp_ext_cidr", "?"),
+         f"{n_ext} VMs   {n_iso} in "
+         f"{g('vm_isolation', 'pg_name', 'pg_isolated')}", ISO),
+        (ls_user, f"{g('user_vms', 'gateway', '?')}/"
+                  f"{g('user_vms', 'subnet', '?/?').split('/')[-1]}",
+         f"{slots}/{n_slots} slots   "
+         f"{g('user_vms', 'pg_name', 'pg_user_vms')}", ISO),
+    ]
+
+    for i, (name, cidr, members, tier) in enumerate(segments):
+        elbow = "└" if i == len(segments) - 1 else "├"
+        art.add(" " * 6, art.cell(elbow + "──► ", LOG),
+                art.cell(name, LOG, 13, "left"),
+                art.cell(f"gw {cidr}", DIM, 21, "left"),
+                art.cell(members, tier), mark(name, present))
+
+    art.add("")
+    art.add(f"  {OUT}▪{RST} outside OVN   {LOG}▪{RST} OVN logical   "
+            f"{TRU}▪{RST} trusted   {ISO}▪{RST} isolated by port group")
+    art.add(f"  {DIM}br-int is omitted: every VIF and host-if binds to it "
+            f"locally, on every path shown.{RST}")
+    split = g("localnet_external", "split_subnet", "")
+    if split:
+        art.add(f"  {DIM}{split} is additionally forced to the ASA by "
+                f"lr-policy, not by the route table.{RST}")
+    art.emit()
 
 
 # ---------------------------------------------------------------------------
@@ -834,6 +1084,7 @@ def show_acls() -> None:
 
 
 _DISPATCH = {
+    "topology": show_topology,
     "chassis": show_chassis,
     "routers": show_routers,
     "switches": show_switches,

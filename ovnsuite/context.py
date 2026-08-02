@@ -59,9 +59,19 @@ class Colour:
         self.red = "\033[31m" if enabled else ""
         self.grn = "\033[32m" if enabled else ""
         self.ylw = "\033[33m" if enabled else ""
+        # Added for `ovnctl show topology`, which colours by trust tier
+        # rather than by severity and needs more than red/green/yellow.
+        # They live here, not in the caller, so the isatty + NO_COLOR
+        # decision is made in exactly one place -- a second copy of that
+        # rule is how a redirected run ends up with escape codes in the
+        # file for one command and not for the others.
+        self.cyan = "\033[36m" if enabled else ""
+        self.mag = "\033[35m" if enabled else ""
+        self.gry = "\033[90m" if enabled else ""
         self.dim = "\033[2m" if enabled else ""
         self.bold = "\033[1m" if enabled else ""
         self.rst = "\033[0m" if enabled else ""
+        self.enabled = enabled
 
 
 class Abort(Exception):
