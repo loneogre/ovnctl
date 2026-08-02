@@ -448,24 +448,17 @@ _ASCII_ART = str.maketrans({
     "►": ">", "◄": "<", "·": "-", "▪": "*", "–": "-", "—": "-",
 })
 
-# Geometry. Every box in the drawing is _CELL wide with its connector
-# tick at _TICK, which is what lets the four segment columns, the centre
-# stack and the router bar line up without a single hand-typed run of
-# padding. Change _CELL or _GAP and the whole drawing re-flows; nothing
-# below re-states a column position as a literal.
+# Geometry. Every box is _CELL wide with its connector tick at _TICK,
+# which is what lets the segment columns, the centre stack and the router
+# bar line up without a single hand-typed run of padding. The number of
+# columns is not fixed any more -- it is however many logical switches
+# the db actually has -- so the widths derive from that at draw time.
 _MARGIN = 4
 _CELL = 24
 _INNER = _CELL - 2
 _GAP = 4
-_N_COL = 4
-_TICK = 11                                        # tick offset within a cell
-_BAR = _N_COL * _CELL + (_N_COL - 1) * _GAP       # width of the lr-core bar
-_ART_W = _MARGIN * 2 + _BAR
-_CX = _MARGIN + (_BAR - _CELL) // 2               # centred single-box stack
-_WGAP = _CX - (_MARGIN + _CELL)                   # world-tier connectors
-#: Column origins, and the tick offsets they need on the bar's bottom edge.
-_COL_X = tuple(_MARGIN + i * (_CELL + _GAP) for i in range(_N_COL))
-_BAR_TICKS = tuple(x - _MARGIN + _TICK for x in _COL_X)
+_TICK = 11                  # tick offset within a cell
+_N_MIN = 4                  # keep the canvas this wide even when emptier
 
 
 def _art_ascii_only() -> bool:
@@ -482,21 +475,6 @@ def _art_ascii_only() -> bool:
     except (UnicodeError, LookupError):
         return True
     return False
-
-
-def _nb_names(table: str) -> set[str] | None:
-    """Names present in an NB table, or None if the db could not be read.
-
-    None and set() are different answers and the drawing treats them
-    differently: an empty NB db means "nothing is deployed", while an
-    unreadable one means "no idea" -- and marking every segment ABSENT
-    because ovn-nbctl is not installed would be a confident lie.
-    `rows()` collapses both to [], so discriminate on the raw payload.
-    """
-    payload = nb("name", table)
-    if not payload:
-        return None
-    return {r[0] for r in rows(payload) if r and isinstance(r[0], str)}
 
 
 class _Art:
@@ -540,82 +518,139 @@ class _Art:
             print(out.rstrip())
 
 
-def show_topology() -> None:
-    """A picture of the logical topology, drawn from the settings file.
+def _ovs_bridges() -> set[str] | None:
+    """Bridge names on this host, or None if ovs-vsctl could not be run.
 
-    Drawn from the CONFIG, annotated from the DB. Those are two different
-    sources and the difference is the point: the boxes are what the
-    settings file says should exist, and anything the northbound db does
-    not actually have gets named in a footnote rather than quietly drawn
-    as if it were there.
-
-    Every segment gets its own column with its own line up into lr-core.
-    An earlier version hung all four off one shared spine, which is the
-    same topology and half the width, but it reads as though the switches
-    are strung together on a bus rather than each being its own router
-    port -- and that is exactly the thing this picture exists to make
-    obvious.
+    None and set() are different answers: an empty result means "no
+    bridges", an unreadable one means "no idea". Drawing br-internal as
+    absent because ovs-vsctl is missing would be a confident lie.
     """
-    print("\n" + "=" * _ART_W)
-    print(" SHOW TOPOLOGY (logical view, from ovn-settings.yaml)")
-    print("=" * _ART_W)
+    payload = run_cmd(["ovs-vsctl", "--format=json", "--columns=name",
+                       "list", "Bridge"])
+    if not payload:
+        return None
+    return {r[0] for r in rows(payload) if r and isinstance(r[0], str)}
 
+
+def _network_of(cidr: str) -> str:
+    """The SUBNET a router port sits on, not the port's own address.
+
+    An lrp's `networks` value is 172.31.1.17/28 -- the gateway. Printing
+    that as the segment's network is the mistake everyone makes reading
+    this topology, so do the masking here rather than inviting it.
+    """
     try:
-        cfg = Config().load()
-    except (ConfigError, OSError) as exc:
-        col = Colour()
-        print(f"{col.dim}No settings file, so there is nothing to draw: "
-              f"{exc}{col.rst}")
-        print(f"{col.dim}The views below read the db directly and are "
-              f"unaffected.{col.rst}")
-        return
+        import ipaddress
+        return str(ipaddress.ip_interface(cidr).network)
+    except (ValueError, TypeError):
+        return ""
 
+
+def show_topology() -> None:
+    """A picture of what is actually deployed, drawn from the NB db.
+
+    Everything here is read from OVN, not from the settings file: a box
+    appears because the object exists, and disappears when it is deleted.
+    That is the whole point of the view -- after `ovnctl delete` this
+    should be as empty as every other section, and a half-built topology
+    should look half-built rather than looking like the yaml.
+
+    The settings file is still consulted, but only to name things that
+    are expected and MISSING, which the db by definition cannot tell you.
+    Those go in a footnote, never in a box.
+    """
     col = Colour()
     art = _Art(col)
-
-    # Trust tiers, matching the documentation diagram: grey is outside
-    # OVN, magenta is OVN's own logical objects, cyan is trusted, yellow
-    # is a segment held down by a port group.
     OUT, LOG, TRU, ISO = col.gry, col.mag, col.cyan, col.ylw
     DIM, RST = col.dim, col.rst
 
-    g = lambda s, k, d="": cfg.cfg_opt(s, k, d)  # noqa: E731
+    try:
+        cfg = Config().load()
+    except (ConfigError, OSError):
+        cfg = None
 
-    lan_gw = g("localnet_internal", "lan_gateway", "?")
-    ws_subnet = g("localnet_internal", "workstation_subnet", "?")
-    br_internal = g("localnet_internal", "br_internal", "br-internal")
-    phys_nic = g("localnet_internal", "phys_nic", "?")
-    physnet = g("localnet_internal", "physnet_label", "physnet")
-    ls_uplink = g("localnet_internal", "ls_uplink", "ls-uplink")
-    ln_uplink = g("localnet_internal", "ln_uplink", "ln-uplink")
-    transit_net = g("localnet_internal", "transit_subnet", "?")
-    transit_ip = g("localnet_internal", "transit_ip", "?")
-    lr_core = g("topology", "lr_core", "lr-core")
+    def g(section: str, key: str, default: str = "") -> str:
+        return cfg.cfg_opt(section, key, default) if cfg else default
 
-    switches = _nb_names("Logical_Switch")
-    routers = _nb_names("Logical_Router")
-    missing: list[str] = []
+    # -- probe the db --------------------------------------------------
+    ls_payload = nb("name,ports", "Logical_Switch")
+    lr_payload = nb("name", "Logical_Router")
+    if not ls_payload and not lr_payload:
+        print("\n" + "=" * 78)
+        print(" SHOW TOPOLOGY (live view, from the NB db)")
+        print("=" * 78)
+        print(f"{DIM}NB db unreachable -- run as root, or check "
+              f"ovn-nbctl.{RST}")
+        return
 
-    def check(name: str, names: set[str] | None) -> None:
-        """Record anything the config declares but the db does not have.
+    sw_ports = {r[0]: extract_ovsdb_ports(r[1])
+                for r in rows(ls_payload) if r and r[0]}
+    routers = [r[0] for r in rows(lr_payload) if r and r[0]]
+    lsp = get_lsp_details_map()
+    lrp_ip = get_lrp_ip_map()
+    pg_count = {r[0]: len(extract_ovsdb_ports(r[1]))
+                for r in rows(nb("name,ports", "Port_Group")) if r and r[0]}
+    bridges = _ovs_bridges()
+    nat_rules = rows(nb("type", "NAT"))
+    static = [(r[0], r[1]) for r in
+              rows(nb("ip_prefix,nexthop", "Logical_Router_Static_Route"))
+              if r]
+    default_via = next((nh for pfx, nh in static if pfx == "0.0.0.0/0"), "")
 
-        Collected rather than printed beside the box: with four columns
-        there is no clear space to the right of one, and a marker wedged
-        into a cell would either overflow it or shift the column. One
-        footnote naming all of them is also the more useful shape -- it
-        is a list you can act on rather than a mark you have to hunt for.
+    def ports_of(sw: str) -> list[dict]:
+        return [lsp[u] for u in sw_ports.get(sw, []) if u in lsp]
+
+    def typed(sw: str, kind: str) -> list[dict]:
+        return [p for p in ports_of(sw) if p["type"] == kind]
+
+    def gw_of(sw: str) -> tuple[str, str]:
+        """(router-port name, its address) for a switch, live from the db.
+
+        A switch with no router port is not a broken read -- it is an
+        orphaned segment, which is worth seeing, so return empty strings
+        and let the caller say so in the box.
         """
-        if names is not None and name not in names:
-            missing.append(name)
+        rp = typed(sw, "router")
+        lrp = rp[0]["options"].get("router-port", "") if rp else ""
+        return lrp, lrp_ip.get(lrp, "")
+
+    # The uplink is whichever switch owns a localnet port. Detected, not
+    # assumed from the name: a rename in the yaml must not silently move
+    # this box somewhere else in the picture.
+    uplink = next((sw for sw in sw_ports if typed(sw, "localnet")), "")
+    lr_core = routers[0] if routers else ""
+
+    # -- decide which columns exist ------------------------------------
+    # Config order first so the picture is stable between runs, then
+    # anything else the db has, so an unexpected switch still shows up.
+    wanted = [g("topology", "ls_host", "ls-host"),
+              g("topology", "ls_int", "ls-int-vm"),
+              g("topology", "ls_ext", "ls-ext-vm"),
+              g("user_vms", "switch", "ls-user-vm")]
+    ordered = [s for s in wanted if s and s in sw_ports and s != uplink]
+    ordered += sorted(s for s in sw_ports
+                      if s != uplink and s not in ordered)
+    unexpected = [s for s in ordered if s not in wanted]
+
+    # -- geometry, derived from the column count -----------------------
+    n = len(ordered)
+    span_cols = max(_N_MIN, n)
+    bar = span_cols * _CELL + (span_cols - 1) * _GAP
+    width = _MARGIN * 2 + bar
+    cx = _MARGIN + (bar - _CELL) // 2
+    wgap = cx - (_MARGIN + _CELL)
+    group = n * _CELL + (n - 1) * _GAP if n else 0
+    col_x = [_MARGIN + (bar - group) // 2 + i * (_CELL + _GAP)
+             for i in range(n)]
+
+    print("\n" + "=" * width)
+    print(" SHOW TOPOLOGY (live view, from the NB db)")
+    print("=" * width)
 
     # -- cell primitives ----------------------------------------------
-    # Every box in the drawing is _CELL wide with its connector tick at
-    # the same offset, which is what lets the four columns, the centre
-    # stack and the router bar all line up without a single hand-typed
-    # run of padding.
     def rule(left: str, right: str, ticks, tick_ch: str,
-             width: int = _CELL) -> str:
-        chars = ["─"] * width
+             w: int = _CELL) -> str:
+        chars = ["─"] * w
         chars[0], chars[-1] = left, right
         for t in ticks:
             chars[t] = tick_ch
@@ -628,163 +663,195 @@ def show_topology() -> None:
         return art.cell(rule("└", "┘", (_TICK,) if tick else (), "┬"), colour)
 
     def c_txt(text: str, colour: str, tcol: str = "") -> str:
-        return (art.cell("│", colour)
-                + art.cell(text, tcol or colour, _INNER)
+        return (art.cell("│", colour) + art.cell(text, tcol or colour, _INNER)
                 + art.cell("│", colour))
 
     def c_stem(colour: str) -> str:
-        return (" " * _TICK + art.cell("│", colour)
-                + " " * (_CELL - _TICK - 1))
-
-    def row(*cells: str) -> None:
-        art.add(" " * _MARGIN + (" " * _GAP).join(cells))
+        return " " * _TICK + art.cell("│", colour) + " " * (_CELL - _TICK - 1)
 
     def mid(cell: str) -> None:
-        art.add(" " * _CX + cell)
+        art.add(" " * cx + cell)
 
-    def trio(a: str, b: str, cc: str, link_l: str = "", link_r: str = "") -> None:
-        art.add(" " * _MARGIN, a, link_l or " " * _WGAP,
-                b, link_r or " " * _WGAP, cc)
+    def col_row(cells: list[str]) -> None:
+        out, at = "", 0
+        for x, cell in zip(col_x, cells):
+            out += " " * (x - at) + cell
+            at = x + _CELL
+        art.add(out)
 
-    # -- the world outside OVN ----------------------------------------
-    trio(c_top(OUT, False), c_top(OUT, False), c_top(OUT, False))
-    trio(c_txt("workstation LAN", OUT), c_txt("ASA firewall", OUT),
-         c_txt("client targets", OUT),
-         art.cell("◄" + "─" * (_WGAP - 1), OUT),
-         art.cell("─" * (_WGAP - 1) + "►", OUT))
-    trio(c_txt(ws_subnet, OUT), c_txt(lan_gw, OUT),
-         c_txt("via default route", OUT))
-    trio(c_bot(OUT, False), c_bot(OUT, tick=True), c_bot(OUT, False))
-    mid(c_stem(OUT))
+    # -- the upper stack, only the tiers that exist --------------------
+    # Assembled as a list first so each box knows whether anything sits
+    # above or below it, and therefore whether to grow a connector tick.
+    # Boxes that are not in the db never get added, which is what makes
+    # the picture collapse after a delete instead of lying.
+    br_name = g("localnet_internal", "br_internal", "br-internal")
+    br_here = bridges is not None and br_name in bridges
 
-    # -- the single physical uplink -----------------------------------
-    mid(c_top(OUT))
-    mid(c_txt(br_internal, OUT))
-    mid(c_txt(f"{phys_nic} · {physnet}", OUT, DIM))
-    mid(c_bot(OUT, tick=True))
-    mid(c_stem(LOG))
+    localnet = typed(uplink, "localnet")[0] if uplink else None
+    physnet = (localnet["options"].get("network_name", "") if localnet
+               else g("localnet_internal", "physnet_label", ""))
+    nic = ""
+    if br_here:
+        nic = " ".join(p for p in run_cmd(
+            ["ovs-vsctl", "list-ports", br_name]).split()
+            if not p.startswith("patch-"))
 
-    mid(c_top(LOG))
-    mid(c_txt(ls_uplink, LOG))
-    mid(c_txt(f"{ln_uplink} (localnet)", LOG, DIM))
-    mid(c_txt(transit_net, LOG, DIM))
-    mid(c_bot(LOG, tick=True))
-    check(ls_uplink, switches)
-    mid(c_stem(LOG))
+    stack: list[tuple] = []
+    if uplink or br_here:
+        stack.append(("world", OUT, []))
+    if br_here:
+        stack.append(("box", OUT,
+                      [br_name, " · ".join(x for x in (nic, physnet) if x)]))
+    if uplink:
+        up_lrp, up_ip = gw_of(uplink)
+        stack.append(("box", LOG, [
+            uplink,
+            f"{localnet['name']} (localnet)" if localnet else "no localnet port",
+            _network_of(up_ip) or "no router port"]))
+    if lr_core:
+        up_lrp, up_ip = gw_of(uplink) if uplink else ("", "")
+        bits = [f"{up_lrp} {up_ip}" if up_lrp else "no uplink port",
+                f"default 0.0.0.0/0 via {default_via}" if default_via
+                else "no default route",
+                "no NAT" if not nat_rules else f"{len(nat_rules)} NAT rules"]
+        stack.append(("bar", LOG, [lr_core, " · ".join(bits)]))
 
-    # -- the router ----------------------------------------------------
-    # One tick per column on the bottom edge, so each logical switch has
-    # its own visible line into lr-core.
-    inner = _BAR - 4
-    art.add(" " * _MARGIN,
-            art.cell(rule("┌", "┐", (_CX + _TICK - _MARGIN,), "┴", _BAR), LOG))
-    # Centred like every other box in the drawing. The bar is wider than
-    # the rest, so left-aligning it was the one thing on the page with a
-    # different alignment -- which reads as an accident rather than as
-    # emphasis.
-    art.add(" " * _MARGIN, art.cell("│ ", LOG),
-            col.bold + art.cell(lr_core, "", inner) + RST,
-            art.cell(" │", LOG))
-    detail = (f"lrp-uplink {transit_ip} · default 0.0.0.0/0 via {lan_gw} "
-              f"· no NAT")
-    art.add(" " * _MARGIN, art.cell("│ ", LOG),
-            art.cell(detail, LOG, inner), art.cell(" │", LOG))
-    art.add(" " * _MARGIN,
-            art.cell(rule("└", "┘", _BAR_TICKS, "┬", _BAR), LOG))
-    check(lr_core, routers)
+    ws_label = g("localnet_internal", "workstation_subnet", "")
+    asa = default_via or g("localnet_internal", "lan_gateway", "")
 
-    # -- the four segments, one column each ---------------------------
-    try:
-        inv = Inventory(cfg)
-    except Abort:
-        inv = None
+    for i, (kind, colour, lines) in enumerate(stack):
+        above = i > 0
+        below = i < len(stack) - 1 or (kind == "bar" and n)
 
-    n_iso = len(inv.isolated) if inv else 0
-    used = len(user_vm_slots())
-    n_slots = g("user_vms", "slots", "10")
-    prefix = g("user_vms", "name_prefix", "user-vm")
-    lrp_int_cidr = g("setup", "lrp_int_cidr", "?")
-    lrp_ext_cidr = g("setup", "lrp_ext_cidr", "?")
+        if kind == "world":
+            left, right = _MARGIN, _MARGIN + bar - _CELL
+            pad = " " * wgap
+            art.add(" " * left, c_top(OUT, False), pad, c_top(OUT, False),
+                    pad, c_top(OUT, False))
+            art.add(" " * left, c_txt("workstation LAN", OUT),
+                    art.cell("◄" + "─" * (wgap - 1), OUT),
+                    c_txt("ASA firewall", OUT),
+                    art.cell("─" * (wgap - 1) + "►", OUT),
+                    c_txt("client targets", OUT))
+            art.add(" " * left, c_txt(ws_label or "outside OVN", OUT),
+                    pad, c_txt(asa or "?", OUT),
+                    pad, c_txt("via default route", OUT))
+            art.add(" " * left, c_bot(OUT, False), pad,
+                    c_bot(OUT, tick=bool(below)), pad, c_bot(OUT, False))
+        elif kind == "box":
+            mid(c_top(colour, tick=above))
+            mid(c_txt(lines[0], colour))
+            for extra in lines[1:]:
+                mid(c_txt(extra, colour, DIM))
+            mid(c_bot(colour, tick=bool(below)))
+        else:                                   # the router bar
+            inner = bar - 4
+            art.add(" " * _MARGIN,
+                    art.cell(rule("┌", "┐", (cx + _TICK - _MARGIN,) if above
+                                  else (), "┴", bar), colour))
+            art.add(" " * _MARGIN, art.cell("│ ", colour),
+                    col.bold + art.cell(lines[0], "", inner) + RST,
+                    art.cell(" │", colour))
+            art.add(" " * _MARGIN, art.cell("│ ", colour),
+                    art.cell(lines[1], colour, inner), art.cell(" │", colour))
+            ticks = tuple(x - _MARGIN + _TICK for x in col_x)
+            art.add(" " * _MARGIN,
+                    art.cell(rule("└", "┘", ticks, "┬", bar), colour))
 
-    def span(vms: list) -> str:
-        """"first – last" for a group, or something honest if it is empty."""
-        if not vms:
-            return "none configured"
-        if len(vms) == 1:
-            return vms[0].name
-        return f"{vms[0].name} – {vms[-1].name}"
+        if below and kind != "bar":
+            mid(c_stem(stack[i + 1][1]))
 
-    def network_of(cidr: str) -> str:
-        """The SUBNET a router port sits on, not the port's own address.
+    # -- the segment columns -------------------------------------------
+    def span(names: list[str]) -> str:
+        if not names:
+            return "no ports"
+        if len(names) == 1:
+            return names[0]
+        return f"{names[0]} – {names[-1]}"
 
-        lrp_int_cidr is 172.31.1.17/28 -- the gateway. Printing that as
-        the segment's network is the mistake everyone makes reading this
-        file, so do the masking here rather than inviting it.
-        """
-        try:
-            import ipaddress
-            return str(ipaddress.ip_interface(cidr).network)
-        except ValueError:
-            return "?"
+    ls_host_n = g("topology", "ls_host", "ls-host")
+    ls_ext_n = g("topology", "ls_ext", "ls-ext-vm")
+    ls_user_n = g("user_vms", "switch", "ls-user-vm")
+    pg_iso = g("vm_isolation", "pg_name", "pg_isolated")
+    pg_user = g("user_vms", "pg_name", "pg_user_vms")
+    slots = g("user_vms", "slots", "")
 
-    columns = [
-        (g("topology", "ls_host", "ls-host"),
-         g("setup", "lrp_host", "lrp-host"),
-         g("setup", "lrp_host_cidr", "?"),
-         ["host-if", g("setup", "host_if_ip", "?"), "OVS internal port"],
-         TRU),
-        (g("topology", "ls_int", "ls-int-vm"),
-         g("setup", "lrp_int", "lrp-int-vm"), lrp_int_cidr,
-         [span(inv.internal if inv else []),
-          f"{len(inv.internal) if inv else 0} VM ports",
-          network_of(lrp_int_cidr)], TRU),
-        (g("topology", "ls_ext", "ls-ext-vm"),
-         g("setup", "lrp_ext", "lrp-ext-vm"), lrp_ext_cidr,
-         [span(inv.external if inv else []),
-          f"{len(inv.external) if inv else 0} VM ports",
-          f"{n_iso} in {g('vm_isolation', 'pg_name', 'pg_isolated')}"], ISO),
-        (g("user_vms", "switch", "ls-user-vm"),
-         g("user_vms", "lrp", "lrp-user-vm"),
-         f"{g('user_vms', 'gateway', '?')}/"
-         f"{g('user_vms', 'subnet', '?/?').split('/')[-1]}",
-         [f"{prefix}1 – {prefix}{n_slots}",
-          f"{used}/{n_slots} slots (dynamic)",
-          g("user_vms", "pg_name", "pg_user_vms")], ISO),
-    ]
+    cols: list[tuple] = []
+    for sw in ordered:
+        lrp, gw = gw_of(sw)
+        vifs = sorted(p["name"] for p in typed(sw, "vif"))
+        tier = TRU if sw in (ls_host_n, g("topology", "ls_int", "ls-int-vm")) \
+            else ISO
+        if sw == ls_host_n and vifs:
+            info = lsp.get(vifs[0], {})
+            addrs = info.get("addrs", "").split()
+            members = [vifs[0], addrs[-1] if addrs else "no address",
+                       "OVS internal port"]
+        elif sw == ls_user_n:
+            members = [span(vifs),
+                       f"{len(vifs)}{'/' + slots if slots else ''} slots "
+                       f"(dynamic)", pg_user if pg_user in pg_count else ""]
+        elif sw == ls_ext_n:
+            members = [span(vifs), f"{len(vifs)} VM ports",
+                       f"{pg_count.get(pg_iso, 0)} in {pg_iso}"
+                       if pg_iso in pg_count else ""]
+        else:
+            members = [span(vifs), f"{len(vifs)} VM ports", _network_of(gw)]
+        cols.append((sw, lrp, gw, members, tier))
 
-    tiers = [c[4] for c in columns]
-    row(*(c_stem(LOG) for _ in columns))
-    row(*(c_top(LOG) for _ in columns))
-    for r in range(3):
-        row(*(c_txt([sw, lrp, f"gw {cidr}"][r], LOG, LOG if r == 0 else DIM)
-              for sw, lrp, cidr, _, _ in columns))
-    row(*(c_bot(LOG, tick=True) for _ in columns))
+    if cols:
+        tiers = [c[4] for c in cols]
+        if lr_core:
+            col_row([c_stem(LOG) for _ in cols])
+        col_row([c_top(LOG, tick=bool(lr_core)) for _ in cols])
+        # An orphaned switch -- one with no router port -- is drawn, not
+        # hidden. It exists, so it belongs in the picture; the missing
+        # gateway is flagged in amber inside the box where you will
+        # actually look for it.
+        left = [[sw, lrp or "no router port", f"gw {gw}" if gw else "—"]
+                for sw, lrp, gw, _, _ in cols]
+        for r in range(3):
+            col_row([c_txt(lines[r], LOG,
+                           LOG if r == 0 else (DIM if cols[i][1] else ISO))
+                     for i, lines in enumerate(left)])
+        col_row([c_bot(LOG, tick=True) for _ in cols])
+        col_row([c_stem(t) for t in tiers])
+        col_row([c_top(t) for t in tiers])
+        for r in range(3):
+            col_row([c_txt(m[r], t, t if r == 0 else DIM)
+                     for _, _, _, m, t in cols])
+        col_row([c_bot(t) for t in tiers])
 
-    row(*(c_stem(t) for t in tiers))
-    row(*(c_top(t) for t in tiers))
-    for r in range(3):
-        row(*(c_txt(members[r], t, t if r == 0 else DIM)
-              for _, _, _, members, t in columns))
-    row(*(c_bot(t) for t in tiers))
+    if not stack and not cols:
+        art.add(f"  {DIM}Nothing deployed -- the NB db has no logical "
+                f"switches or routers.{RST}")
 
-    for sw, _, _, _, _ in columns:
-        check(sw, switches)
-
-    # -- legend and footnotes -----------------------------------------
+    # -- legend and footnotes ------------------------------------------
     art.add("")
     art.add(f"  {OUT}▪{RST} outside OVN   {LOG}▪{RST} OVN logical   "
             f"{TRU}▪{RST} trusted   {ISO}▪{RST} isolated by port group")
     art.add(f"  {DIM}br-int is omitted: every VIF and host-if binds to it "
             f"locally, on every path shown.{RST}")
-    split = g("localnet_external", "split_subnet", "")
-    if split:
-        art.add(f"  {DIM}{split} is additionally forced to the ASA by "
-                f"lr-policy, not by the route table.{RST}")
-    if missing:
-        art.add(f"  {col.ylw}!{RST} declared in the settings file but NOT in "
-                f"the NB db: {', '.join(missing)}")
-        art.add(f"    {DIM}Nothing is enforcing what the box claims. "
-                f"-> ovnctl diagnose{RST}")
+
+    expected = [g("topology", "lr_core", ""),
+                g("localnet_internal", "ls_uplink", "")] + wanted
+    have = set(sw_ports) | set(routers)
+    absent = [x for x in expected if x and x not in have]
+    if absent:
+        src = "ovn-settings.yaml" if cfg else "the built-in defaults"
+        art.add(f"  {col.ylw}!{RST} in {src} but NOT deployed: "
+                f"{', '.join(absent)}")
+        art.add(f"    {DIM}-> ovnctl deploy, or ovnctl diagnose to see "
+                f"why.{RST}")
+    if unexpected:
+        art.add(f"  {col.ylw}!{RST} deployed but not in the settings file: "
+                f"{', '.join(unexpected)}")
+    if ls_user_n in sw_ports:
+        tracked = len(user_vm_slots())
+        live = len([p for p in typed(ls_user_n, "vif")])
+        if tracked != live:
+            art.add(f"  {col.ylw}!{RST} user-VM tracker and db disagree: "
+                    f"{tracked} in state, {live} in OVN.")
     art.emit()
 
 
