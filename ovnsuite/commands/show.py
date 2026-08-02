@@ -445,7 +445,7 @@ def _vm_domain(p_type: str, name: str, addr_str: str,
 _ASCII_ART = str.maketrans({
     "─": "-", "│": "|", "┌": "+", "┐": "+", "└": "+", "┘": "+",
     "├": "+", "┤": "+", "┬": "+", "┴": "+", "┼": "+",
-    "►": ">", "◄": "<", "·": "-", "▪": "*",
+    "►": ">", "◄": "<", "·": "-", "▪": "*", "–": "-", "—": "-",
 })
 
 #: Inner width of a top-tier box, and the overall width of the drawing.
@@ -635,37 +635,109 @@ def show_topology() -> None:
     except Abort:
         inv = None
 
-    n_int = len(inv.internal) if inv else 0
-    n_ext = len(inv.external) if inv else 0
     n_iso = len(inv.isolated) if inv else 0
-    slots = len(user_vm_slots())
-
-    ls_host = g("topology", "ls_host", "ls-host")
-    ls_int = g("topology", "ls_int", "ls-int-vm")
-    ls_ext = g("topology", "ls_ext", "ls-ext-vm")
-    ls_user = g("user_vms", "switch", "ls-user-vm")
+    used = len(user_vm_slots())
     n_slots = g("user_vms", "slots", "10")
+    prefix = g("user_vms", "name_prefix", "user-vm")
+    lrp_host_cidr = g("setup", "lrp_host_cidr", "?")
+    lrp_int_cidr = g("setup", "lrp_int_cidr", "?")
+    lrp_ext_cidr = g("setup", "lrp_ext_cidr", "?")
+
+    def span(vms: list) -> str:
+        """"first - last" for a group, or something honest if it is empty."""
+        if not vms:
+            return "none configured"
+        if len(vms) == 1:
+            return vms[0].name
+        return f"{vms[0].name} \u2013 {vms[-1].name}"
+
+    def network_of(cidr: str) -> str:
+        """The SUBNET a router port sits on, not the port's own address.
+
+        lrp_int_cidr is 172.31.1.17/28 -- the gateway. Printing that as
+        the segment's network is the mistake everyone makes reading this
+        file, so do the masking here rather than inviting it.
+        """
+        try:
+            import ipaddress
+            return str(ipaddress.ip_interface(cidr).network)
+        except ValueError:
+            return "?"
 
     segments = [
-        (ls_host, g("setup", "lrp_host_cidr", "?"),
-         f"host-if {g('setup', 'host_if_ip', '?')}", TRU),
-        (ls_int, g("setup", "lrp_int_cidr", "?"),
-         f"{n_int} VMs   int-vm ports", TRU),
-        (ls_ext, g("setup", "lrp_ext_cidr", "?"),
-         f"{n_ext} VMs   {n_iso} in "
-         f"{g('vm_isolation', 'pg_name', 'pg_isolated')}", ISO),
-        (ls_user, f"{g('user_vms', 'gateway', '?')}/"
-                  f"{g('user_vms', 'subnet', '?/?').split('/')[-1]}",
-         f"{slots}/{n_slots} slots   "
-         f"{g('user_vms', 'pg_name', 'pg_user_vms')}", ISO),
+        (g("topology", "ls_host", "ls-host"),
+         g("setup", "lrp_host", "lrp-host"), lrp_host_cidr,
+         ["host-if",
+          g("setup", "host_if_ip", "?"),
+          "OVS internal port on br-int"], TRU),
+        (g("topology", "ls_int", "ls-int-vm"),
+         g("setup", "lrp_int", "lrp-int-vm"), lrp_int_cidr,
+         [span(inv.internal if inv else []),
+          f"{len(inv.internal) if inv else 0} VM ports",
+          network_of(lrp_int_cidr)], TRU),
+        (g("topology", "ls_ext", "ls-ext-vm"),
+         g("setup", "lrp_ext", "lrp-ext-vm"), lrp_ext_cidr,
+         [span(inv.external if inv else []),
+          f"{len(inv.external) if inv else 0} VM ports",
+          f"{n_iso} in {g('vm_isolation', 'pg_name', 'pg_isolated')}"], ISO),
+        (g("user_vms", "switch", "ls-user-vm"),
+         g("user_vms", "lrp", "lrp-user-vm"),
+         f"{g('user_vms', 'gateway', '?')}/"
+         f"{g('user_vms', 'subnet', '?/?').split('/')[-1]}",
+         [f"{prefix}1 \u2013 {prefix}{n_slots} (dynamic)",
+          f"{used}/{n_slots} slots allocated",
+          g("user_vms", "pg_name", "pg_user_vms")], ISO),
     ]
 
-    for i, (name, cidr, members, tier) in enumerate(segments):
-        elbow = "└" if i == len(segments) - 1 else "├"
-        art.add(" " * 6, art.cell(elbow + "──► ", LOG),
-                art.cell(name, LOG, 13, "left"),
-                art.cell(f"gw {cidr}", DIM, 21, "left"),
-                art.cell(members, tier), mark(name, present))
+    # Two columns of boxes, mirroring the documentation diagram: the
+    # logical switch and its router port on the left, what is actually
+    # attached to it on the right. Column geometry is derived from the
+    # widths rather than typed as literal padding, so a wider box does
+    # not silently shear the arrow column out of alignment.
+    SW_W, MEM_W = 24, 37          # outer widths
+    sw_in, mem_in = SW_W - 2, MEM_W - 2
+    gap_l, gap_r = " ", " "       # around the "──►" between the columns
+
+    for i, (name, lrp, cidr, members, tier) in enumerate(segments):
+        last = i == len(segments) - 1
+        left = [name, lrp, f"gw {cidr}"]
+
+        def trunk(row: int) -> str:
+            """Column 6: the spine coming down from lr-core.
+
+            It carries on past every segment but the last, where it turns
+            into the elbow and stops -- so the drawing shows four
+            branches off one router port list, not four unrelated boxes
+            that happen to be stacked.
+            """
+            if row == 2:
+                return art.cell(("\u2514" if last else "\u251c")
+                                + "\u2500\u25ba", LOG)
+            if last and row > 2:
+                return "   "
+            return art.cell("\u2502", LOG) + "  "
+
+        def hrule(ch_l: str, ch_r: str) -> None:
+            art.add(" " * 6, trunk(0 if ch_l == "\u250c" else 4),
+                    art.cell(ch_l + "\u2500" * sw_in + ch_r, LOG), " " * 5,
+                    art.cell(ch_l + "\u2500" * mem_in + ch_r, tier))
+
+        hrule("\u250c", "\u2510")
+        for r in range(3):
+            joined = r == 1
+            mid = (gap_l + art.cell("\u2500\u2500\u25ba", LOG) + gap_r
+                   if joined else " " * 5)
+            art.add(" " * 6, trunk(r + 1),
+                    art.cell("\u2502", LOG),
+                    art.cell(left[r], LOG if r == 0 else DIM, sw_in),
+                    art.cell("\u2502", LOG), mid,
+                    art.cell("\u2502", tier),
+                    art.cell(members[r], tier if r == 0 else DIM, mem_in),
+                    art.cell("\u2502", tier),
+                    mark(name, present) if joined else "")
+        hrule("\u2514", "\u2518")
+        if not last:
+            art.add(" " * 6, art.cell("\u2502", LOG))
 
     art.add("")
     art.add(f"  {OUT}▪{RST} outside OVN   {LOG}▪{RST} OVN logical   "
