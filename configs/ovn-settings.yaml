@@ -78,9 +78,6 @@ setup:
     - "172.31.1.32/28"
     - "172.31.0.0/27"
 
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
   # Metric for the routes above, on BOTH paths that install them: the
   # NetworkManager profile written by `--install-nm-profile` and the
   # `ip route replace` that setup and reconcile run.
@@ -99,8 +96,6 @@ setup:
   # of a NM-managed ethernet uplink.
   host_route_metric: 100
 
->>>>>>> f74f8b2 (commits)
-=======
   # Metric for the routes in the NetworkManager profile written by
   # `ovnctl reconcile --install-nm-profile`. Unset means "let
   # NetworkManager choose", which for an OVS internal port is 550 --
@@ -112,7 +107,6 @@ setup:
   # deterministic rather than a side effect of NM's device typing.
   # host_route_metric: 100
 
->>>>>>> 0b99729 (reconcile: optional route metric for the host-if NM profile)
   # Legacy single-route fields, still honoured if host_routes is absent.
   remote_subnet: 172.31.1.32/28
   remote_gw: 172.31.1.10

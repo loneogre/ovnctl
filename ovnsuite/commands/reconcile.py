@@ -392,7 +392,7 @@ def _nm_profile(setup: Setup) -> str:
         "method=manual",
         f"address1={setup.host_if_cidr}",
     ]
-<<<<<<< HEAD
+
     metric = str(setup.host_route_metric).strip() if setup.host_route_metric else ""
     routes = [net for net in setup.host_routes if net.strip()]
     for n, net in enumerate(routes, start=1):
@@ -412,11 +412,10 @@ def _nm_profile(setup: Setup) -> str:
         # metric neither can see -- or replace -- the other's copy, so
         # every prefix ends up installed twice.
         lines.append(f"route-metric={metric}")
-=======
+
     routes = [net for net in setup.host_routes if net.strip()]
     for n, net in enumerate(routes, start=1):
         lines.append(f"route{n}={net},{setup.host_gw}")
->>>>>>> 1fab452 (reconcile: persist host-if via a NetworkManager keyfile)
     lines += [
         "never-default=true",
         "",
@@ -427,7 +426,7 @@ def _nm_profile(setup: Setup) -> str:
     return "\n".join(lines)
 
 
-<<<<<<< HEAD
+
 # NetworkManager connection types that CREATE a kernel device rather than
 # just configuring one that already exists. A profile of one of these
 # types pointed at host-if takes the name before ovs-vswitchd can, at
@@ -462,8 +461,6 @@ def _nm_conflicting_profiles(ctx: Ctx, iface: str, own_uuid: str) -> list[str]:
     return found
 
 
-=======
->>>>>>> 1fab452 (reconcile: persist host-if via a NetworkManager keyfile)
 def _install_nm_profile(ctx: Ctx) -> int:
     if not ctx.have("nmcli"):
         ctx.err("nmcli not found -- NetworkManager does not appear to be "
@@ -475,7 +472,6 @@ def _install_nm_profile(ctx: Ctx) -> int:
     path = NM_PROFILE_DIR / f"{setup.host_if}.nmconnection"
     content = _nm_profile(setup)
 
-<<<<<<< HEAD
     # A profile that creates the device defeats the whole arrangement, and
     # does so silently: everything downstream still looks configured while
     # ovn-controller has no ofport to bind.
@@ -511,8 +507,6 @@ def _install_nm_profile(ctx: Ctx) -> int:
                  "metrics and each prefix will end up duplicated.")
         ctx.warn("Set it (100 is a reasonable value) and re-run this.")
 
-=======
->>>>>>> 1fab452 (reconcile: persist host-if via a NetworkManager keyfile)
     ctx.dr_head("NetworkManager profile")
     if ctx.dry_run:
         print(f"cat > {path} <<'EOF'")
@@ -565,15 +559,12 @@ def _install_nm_profile(ctx: Ctx) -> int:
     if ctx.run("nmcli", "connection", "up", setup.host_if):
         ctx.say(f"Activated {setup.host_if}; it will come up with this address "
                 "and these routes at every boot.")
-<<<<<<< HEAD
         # Rewriting the keyfile drops any hand-added key, but routes an
         # earlier version of it already installed in the kernel at another
         # metric are not NM's to remove. reconcile's host-interface step
         # deletes them.
         ctx.say("Run `ovnctl reconcile` now to clear any copy of these "
                 "routes left in the kernel at a different metric.")
-=======
->>>>>>> 1fab452 (reconcile: persist host-if via a NetworkManager keyfile)
     else:
         ctx.warn(f"Could not activate {setup.host_if} now. Check: "
                  f"nmcli connection up {setup.host_if}")
