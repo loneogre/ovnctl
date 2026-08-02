@@ -105,7 +105,7 @@ The single source of truth. Sixteen sections:
 | section | consumed by |
 |---|---|
 | `topology` | shared names (`br_int`, `ls_int`, `ls_ext`, `ls_host`, `lr_core`, `host_if`) — identity, not tuning |
-| `setup` | external-ids, encap, `system_id`, the three router ports and the host interface |
+| `setup` | external-ids, encap, `system_id`, the three router ports and the host interface (including `host_routes` and `host_route_metric`) |
 | `localnet_internal` | the workstation-LAN uplink bridge, transit subnet, gateway priority |
 | `localnet_external` | the split subnet (and the legacy second-NIC keys, if still present) |
 | `internal_ranges` | "what counts as ours" |
@@ -120,6 +120,16 @@ The single source of truth. Sixteen sections:
 | `vm_names` | display-name mapping |
 | `pcap` | capture directory, targets, rotation, snaplen, mirror prefix |
 | `diagnose` | check tuning |
+
+`[setup].host_route_metric` is the one key here whose value has to agree
+with something outside the file. Both owners of the host routes —
+the NetworkManager keyfile and the `ip route replace` in `setup` and
+`reconcile` — install the same prefixes, and `replace` matches on
+*(destination, metric)*. Left unset, NetworkManager picks its own default
+for an OVS internal port and the kernel gives an unqualified `ip route`
+metric 0, so neither owner can see or replace the other's copy and every
+prefix ends up installed twice. Any value works as long as it is set;
+`--install-nm-profile` warns when it is not.
 
 The file header documents the format constraints it must stay inside: two
 levels only, `key: value` at 2-space indent, lists as `key:` followed by
@@ -391,7 +401,7 @@ builds policies or ACLs calls in here first and says so out loud.
 | `ip_in_ranges` | membership test |
 | `set_literal` | build an OVN address-set literal `{a,b,c}` |
 
-### `ovn.py` (542 lines)
+### `ovn.py` (580 lines)
 
 Thin helpers around `ovs-vsctl`, `ovn-nbctl`, `ovn-sbctl` and `ovn-trace`.
 
@@ -402,7 +412,19 @@ them.
 
 **ovs-vsctl** — `br_exists`, `list_br`, `list_ports`, `iface_type`,
 `external_id`, `has_external_id`, `iface_for_iface_id`, `iface_id_map`
-(one query for the whole Interface table), `iface_id_of`, `mirror_exists`.
+(one query for the whole Interface table), `iface_id_of`, `mirror_exists`,
+`iface_health`, `iface_is_healthy`.
+
+**`iface_health(ctx, iface)`** returns `(ofport, error)` and is the test
+for "does this interface actually work", as distinct from "does a row
+describing it exist". ovs-vswitchd fills `ofport` and clears `error` only
+once it has really opened the netdev; until then the row can look entirely
+correct — right name, right type, right `iface-id`, sitting on br-int —
+while the datapath has nothing behind it and ovn-controller has no port to
+bind. `admin_state` and `link_state` read as the *empty set* in that
+state rather than `down`, which is easy to skim past. `ofport -1` is
+unambiguous. `(0, "")` means the interface does not exist at all, so
+callers can tell "no row" from "row with no datapath".
 
 **ovn-nbctl** — existence probes (`lr_exists`, `ls_exists`, `lsp_exists`,
 `lrp_present`), port-group access (`pg_uuid`, `pg_exists`, `pg_members`),
@@ -601,7 +623,7 @@ the work as one method per step, and a `main(ctx, args)` that validates
 config, checks preconditions, builds a `StepRunner`, runs it, and records
 state.
 
-### `setup.py` (444 lines) — `ovnctl setup`
+### `setup.py` (565 lines) — `ovnctl setup`
 
 Port of `ovn-setup.sh`. Base topology for a single-node OVN environment.
 
@@ -626,6 +648,46 @@ appeared, rather than just timing out), `_kernel_mac` / `_fix_kernel_mac`,
 `self.identity_changed` is set when `external_ids()` had to rewrite
 system-id, so later steps and `reconcile` know the chassis was just
 re-registered under a different name.
+
+**`_ensure_ovs_port()`** owns the creation of the internal port, and is
+the reason `host-interface` can repair as well as build. The guard used to
+be "if `port-to-br` fails, add-port; otherwise skip", which conflates the
+existence of a port row with a working interface. Once a broken row
+existed nothing would ever rebuild it: `setup` and `reconcile` both went
+on re-asserting the `iface-id` on a dead row for as long as anyone cared
+to re-run them, while `diagnose` reported an unbound port and pointed at
+`reconcile`. It now checks `ovn.iface_health()`, and deletes and recreates
+the port when `ofport` is not positive, reporting what ovs-vswitchd said.
+
+**`_link_kind()` / `_reclaim_name()` / `PLACEHOLDER_KINDS`.** Kernel
+device names are a single global namespace: whoever creates a device
+called `host-if` first owns it, and ovs-vswitchd then cannot create its
+internal port, failing with
+
+```
+could not add network device host-if to ofproto (File exists)
+```
+
+The most common way to get there is a NetworkManager profile of a
+device-creating type (`dummy`, `bridge`, `ovs-interface`) bound to that
+interface name — and because such a profile recreates the device at every
+boot, this needs handling rather than reporting once. `_link_kind()` reads
+the device kind from `ip -d link show`; `_reclaim_name()` deletes the
+squatter when it is a `dummy` or `veth` (placeholders, by definition not
+carrying anything) and aborts with instructions for any other kind, since
+a bridge or a bond might be. It runs only after the OVS port row has been
+deleted, so it can never fire against a device OVS is legitimately
+driving, and it only ever looks at the configured `host_if` name.
+
+**`_add_routes()` / `_route_metrics()`** install the host routes at
+`[setup].host_route_metric`. `ip route replace` matches on *(destination,
+metric)*, so a copy of a prefix at any other metric is invisible to it and
+survives alongside the one being written. With NetworkManager holding the
+same routes at its own metric and this code writing them at metric 0, the
+two owners could not see each other's copies and every prefix ended up
+installed twice, one extra pair per reconcile. `_route_metrics()` reports
+every metric a prefix currently sits at so the strays can be removed
+before the canonical route is written.
 
 ### `localnet_internal.py` (337 lines) — `ovnctl localnet-internal`
 
@@ -853,7 +915,7 @@ but not as the same failure as a genuinely different rule.
 
 Exit status is 1 if any check failed, so this can gate a deployment.
 
-### `pcap.py` (916 lines) — `ovnctl pcap`
+### `pcap.py` (920 lines) — `ovnctl pcap`
 
 Port of `ovn-pcap.sh`. Captures traffic from VM logical ports using OVS
 port mirroring (SPAN).
@@ -893,7 +955,17 @@ Modes rather than steps — `--start`, `--stop`, `--restart`, `--status`
 under `/run/ovn-pcap`. `check_disk()` enforces `[pcap].min_free_mb` and
 `max_files`; `sweep_inflight()` reconciles leftovers from an unclean stop.
 
-### `diagnose.py` (1208 lines) — `ovnctl diagnose`
+`--start` with `[pcap].enabled: false` logs why nothing started and
+**exits 0**. It used to abort. A config switch set to off is a decision
+someone made, and a correctly-refused no-op is not a failure of anything —
+but it meant every `deploy` on a host that has simply chosen not to
+capture printed an `ERROR`, a `WARN … exited 1`, and a skipped stage in
+the summary, on every single run. Permanent expected noise is how people
+learn to stop reading output. Leaving `enabled` false still guarantees a
+capture cannot begin without being recorded in config, which is the point
+of the switch.
+
+### `diagnose.py` (1290 lines) — `ovnctl diagnose`
 
 Port of `ovn-diagnose.sh`. Walks the OVN/OVS stack layer by layer to find
 where connectivity is breaking. The largest module in the suite.
@@ -924,7 +996,7 @@ Sixteen steps:
 | `port-security` | VM port security |
 | `range-overlap` | range overlap and the policy tiers |
 | `flows` | OpenFlow rules on br-int |
-| `host-if` | the host-facing OVS interface |
+| `host-if` | the host-facing OVS interface, and whether its configuration will survive a reboot |
 | `live-arp` | live ARP/ping test of the gateway |
 | `summary` | the failure/warning tally |
 
@@ -936,6 +1008,35 @@ checking one is set — `Port_Binding.chassis` survives a reboot, so a
 binding can name a chassis nothing is running under, and resolving the name
 is the difference between a live binding and a fossil.
 
+**`check_host_if` (step 7) reads `ofport` and `error`, not just
+`iface-id`.** Every other field in the Interface row can be exactly right
+while ovs-vswitchd has failed to open the netdev behind it, and in that
+state `admin_state` and `link_state` render as the empty set rather than
+`down` — so the row reads as healthy under an `[ OK ]` while
+ovn-controller has nothing to bind and the host reaches nothing. When
+`ofport` is not positive the step fails, prints what ovs-vswitchd said,
+and uses `_link_kind()` to name the device kind holding the interface
+name, which is usually the whole explanation.
+
+**`check_port_binding_sweep` (step 5b) checks `ofport` before blaming the
+reboot race.** ovn-controller cannot claim a port with `ofport -1`, and no
+number of restarts will change that. Sending the operator to `reconcile`
+there is worse than saying nothing: it looks like a fix, does nothing, and
+hides the real cause behind a plausible one. The unbound-VIF branch now
+distinguishes "no datapath, rebuild the port" from the genuine race, and
+from the identity-drift case where a restart would actively make things
+worse.
+
+**`_check_persistence()`** runs at the end of step 7. An interface being
+correct right now says nothing about whether it will be correct after a
+reboot, and that is the failure people actually hit — everything green,
+reboot, host-if bare again. It reports which mechanism is armed and
+distinguishes the two ways the NetworkManager path silently does nothing:
+a keyfile present while the device is unmanaged, and a device managed at
+runtime only, with `99-ovnctl-host-if.conf` missing so the flag will be
+gone at the next boot. A fully green step 7 now means the configuration
+will still be there tomorrow.
+
 Three latent faults were fixed in the port: `check_isolation` referenced an
 undefined `_iso_vms`, silently breaking the live non-member proof; three
 calls passed a third argument to the two-argument `cfg()`, which exits on a
@@ -943,7 +1044,7 @@ miss; and `require_cfg` demanded `[localnet_external].br_asa` / `.phys_nic`,
 which no longer exist, so the whole script aborted before running a single
 check on a single-NIC host.
 
-### `reconcile.py` (394 lines) — `ovnctl reconcile`
+### `reconcile.py` (700 lines) — `ovnctl reconcile`
 
 **No shell ancestor.** `deploy` builds a deployment and `delete` removes
 one; neither answers the question a reboot asks.
@@ -971,13 +1072,101 @@ It reuses `setup.Setup` for the host-interface work rather than
 reimplementing it.
 
 `--repair-identity` additionally deletes stale chassis rows.
-`--install-unit` writes `/etc/systemd/system/ovn-reconcile.service`, ordered
-`After=ovn-controller.service openvswitch.service`, and enables it — the
-ordering matters because reconcile compares the registered chassis against
-the configured identity, and there is nothing to compare against until the
-controller has connected to the SB db.
 
-### `delete.py` (609 lines) — `ovnctl delete` (alias `teardown`)
+#### `--install-unit`
+
+Writes `/etc/systemd/system/ovn-reconcile.service` and enables it.
+Ordered after `ovn-controller.service`, the Open vSwitch unit and
+`NetworkManager.service`: reconcile compares the registered chassis
+against the configured identity and there is nothing to compare against
+until the controller has connected to the SB db, and NetworkManager goes
+first so that reconcile only has to fix what NM did not.
+
+All the dependencies are `Wants=`, never `Requires=`. The unit name for
+Open vSwitch differs between distributions (`openvswitch.service`,
+`ovs-vswitchd.service`, `openvswitch-switch.service`), and a `Requires=`
+on one that does not exist here fails the job outright — silently, because
+a cancelled job is not a failed one and nothing appears in
+`systemctl status ovn-reconcile`. The single thing that repairs a boot
+must not be able to disappear that quietly.
+
+#### `--install-nm-profile`
+
+Covers the host-if half declaratively instead of once per boot. It
+generates `/etc/NetworkManager/system-connections/host-if.nmconnection`
+from `[setup]` in `ovn-settings.yaml` — `host_if_ip`/`host_if_prefix` as
+the address and every `host_routes` entry as a static route via
+`lrp_host_cidr`, each at `host_route_metric`. The config stays the single
+source of truth, so the profile cannot drift from what `setup` and
+`reconcile` apply. Preview with `-n`.
+
+Three things about the generated profile are load-bearing, and each was a
+failure that presented as "correct now, bare after a reboot":
+
+**The profile type is read from the device, not assumed.**
+`_nm_device_type()` asks NetworkManager what it thinks `host-if` is
+before the file is generated. An OVS internal port has driver
+`openvswitch`, which NM does not recognise as ethernet, so it types the
+device `openvswitch` or `generic` depending on version — and NM refuses to
+activate a connection whose type does not match the device's. An
+`802-3-ethernet` profile there does not half-work; it writes cleanly,
+`nmcli connection reload` accepts it, and it then silently never
+activates. A generic connection has no `cloned-mac-address` property,
+which costs nothing: the MAC lives in the OVS Interface row, where it
+belongs and where it survives a reboot on its own. If NM reports
+`ovs-interface` — its OVS plugin is loaded and reading ovsdb — the command
+refuses, because the only profile NM would accept then needs an
+`ovs-port` and `ovs-bridge` profile above it, handing br-int to
+NetworkManager.
+
+**The managed flag has to be persistent.** NetworkManager leaves OVS
+internal ports unmanaged on many hosts, and an unmanaged device never
+autoconnects, so the keyfile sits on disk doing nothing.
+`nmcli device set host-if managed yes` writes to `/run/NetworkManager` and
+so lasts exactly until the next reboot — the one moment it needs to hold.
+The command therefore also writes
+`/etc/NetworkManager/conf.d/99-ovnctl-host-if.conf` with a
+`[device-ovnctl-host-if]` section setting `managed=1`, the persistent form
+of the same flag, which outranks `[keyfile].unmanaged-devices`. That file
+is written and applied (`systemctl reload NetworkManager` — `nmcli
+connection reload` only rescans keyfiles) *before* the device type is
+read, because NM's answer to "what type is this device" is not dependable
+while the device is unmanaged.
+
+**No `gateway=`, and `never-default=true`.** An `ipv4.gateway` on host-if
+installs a default route through `lr-core` that then carries the host's
+entire egress. The host reaches the VM segments through the explicit
+`host_routes` only.
+
+`_nm_conflicting_profiles()` refuses to write at all while another NM
+profile of a device-creating type (`NM_DEVICE_CREATING_TYPES` — `dummy`,
+`bridge`, `bond`, `ovs-interface`, …) is bound to the same interface name,
+and names it. Such a profile wins the race for the device name at every
+boot and leaves the OVS port with no datapath; see `setup._reclaim_name()`.
+
+A failed activation prints nmcli's own error text rather than telling the
+operator to re-run the command to see it, and a successful one re-reads
+`GENERAL.STATE`: `unmanaged` means something outranks the conf.d snippet,
+and `connected (externally)` means NM is *describing* configuration
+someone else applied rather than applying this profile — it reads as
+connected while the profile is not in force, so the device looks fine and
+still comes back bare.
+
+#### Files written on the host
+
+| path | written by | purpose |
+|---|---|---|
+| `/etc/systemd/system/ovn-reconcile.service` | `--install-unit` | run `reconcile` at every boot |
+| `/etc/NetworkManager/system-connections/host-if.nmconnection` | `--install-nm-profile` | address + routes, reapplied whenever the device appears |
+| `/etc/NetworkManager/conf.d/99-ovnctl-host-if.conf` | `--install-nm-profile` | keep host-if managed across reboots |
+
+Both mechanisms are worth having. The keyfile reapplies whenever the
+device appears, including after an ovs-vswitchd restart that recreates the
+internal port mid-boot; the unit covers what NetworkManager cannot see —
+`system-id`, gateway pins, and rebuilding the OVS port itself if it comes
+back with no datapath.
+
+### `delete.py` (645 lines) — `ovnctl delete` (alias `teardown`)
 
 Port of `ovndelete.sh`. Reverses the OVN/OVS config so you can start from
 scratch.
@@ -990,7 +1179,8 @@ bridge to remove outright.
 
 Steps:
 
-1. `host-networking` — flush addresses/routes on br-int internal ports
+1. `host-networking` — release NetworkManager, then flush addresses/routes
+   on br-int internal ports
 2. `ovs-ports` — remove those OVS ports
 3. `uplink-bridges` — remove every other OVS bridge and free its NIC (and
    re-manage that NIC in NetworkManager)
@@ -1006,6 +1196,18 @@ Steps:
 13. `verify-clean` — confirm the SB db is empty
 14. `tracker` — erase the deployment tracker
 15. `show` — *(`-v`)* dump `ovs-vsctl` / `ovn-nbctl show`
+
+**`_nm_release()`** runs before the flush in step 1. Once
+`reconcile --install-nm-profile` has run, NetworkManager owns the address
+and routes on host-if: it sees them disappear and puts them straight back,
+so the teardown reports the interface flushed while the host still carries
+`172.31.x` and routes into a topology that no longer exists. That is worse
+than not flushing at all, because it looks finished. The profile itself is
+deliberately left on disk — it is generated from `ovn-settings.yaml`,
+costs nothing while the device is gone, and NM reapplies it as soon as
+`deploy` recreates the port. Deleting it would mean every delete/deploy
+cycle silently reverted the host to not-reboot-safe until someone
+remembered to re-run `--install-nm-profile`.
 
 `--purge-db` is belt-and-braces on top of the object-level wipe, which
 already removes everything logically. `--keep-br-int` leaves br-int in
@@ -1152,6 +1354,40 @@ component by `--remove`, truncated entirely by `delete`. Read by
 `0` success · `1` failure (including `diagnose` finding problems) ·
 `2` usage error · `130` interrupted.
 
+An optional `deploy` stage that declines to run is not a failure and does
+not affect the exit code — it lands in `skipped`, not `failed`.
+
+### host-if persistence
+
+The host's own path into the internal segments is the piece of this
+deployment most likely to be silently absent after a reboot, because it is
+the piece that lives entirely in kernel state no database records. Three
+things have to hold, and each of them failed independently at some point:
+
+1. **The OVS internal port has a datapath.** `ofport -1` means
+   ovs-vswitchd could not open the netdev — almost always because another
+   device already owns the name. `setup._ensure_ovs_port()` rebuilds it;
+   `diagnose` step 7 detects it.
+2. **The kernel side is configured.** Address, routes and link state are
+   applied by `setup`/`reconcile`, and reapplied at boot by the
+   NetworkManager keyfile, the systemd unit, or both.
+3. **The mechanism that reapplies it is actually armed.** A keyfile of the
+   wrong connection type never activates; a managed flag set at runtime is
+   gone by the next boot. `diagnose._check_persistence()` checks this
+   rather than leaving the next reboot to discover it.
+
+The recommended arrangement is both mechanisms:
+
+```
+sudo ovnctl reconcile --install-nm-profile
+sudo ovnctl reconcile --install-unit
+```
+
+The keyfile reapplies whenever the device appears, including mid-boot
+after an ovs-vswitchd restart. The unit covers what NetworkManager cannot
+see: `system-id`, gateway pins, ovn-controller's claims, and rebuilding
+the OVS port if it comes back broken.
+
 ---
 
 ## 6. Behavioural fixes carried in the port
@@ -1188,6 +1424,61 @@ it, so a stray command in a config file would execute.
 **`unit_exists` no longer uses `systemctl … | grep -q`.** grep exits on
 first match, systemctl takes SIGPIPE, and the pipeline reports failure
 despite having matched.
+
+### Fixes made after the port, chasing one bug
+
+The following all came out of a single investigation into "host-if has no
+address after a reboot", and are listed together because each one masked
+the next.
+
+**A broken OVS port was never rebuilt.** `host-interface` skipped
+`add-port` whenever a port row existed, conflating the row with a working
+interface. A row with `ofport -1` therefore survived every `setup` and
+every `reconcile` indefinitely, both of which went on re-asserting the
+`iface-id` on it.
+
+**`diagnose` reported that broken port as healthy.** Step 7 checked
+`iface-id` and printed `admin_state`/`link_state` as an informational
+detail, returning `[ OK ]` regardless — and an unopened interface renders
+those as the empty set, not `down`.
+
+**`diagnose` then misattributed the resulting unbound port to the reboot
+race** and recommended `reconcile`, which cannot fix a port with no
+`ofport`. A recommendation that looks like a fix and does nothing is worse
+than none.
+
+**A device-creating NetworkManager profile could take the interface name
+at every boot**, leaving the OVS port with no datapath. `setup` now
+reclaims the name from a `dummy` or `veth` placeholder;
+`--install-nm-profile` refuses to write while such a profile exists.
+
+**The NetworkManager keyfile was `type=ethernet`.** NM types an OVS
+internal port `openvswitch` or `generic` and refuses to activate a
+connection whose type does not match the device's, so the profile wrote
+cleanly and then never activated once. The type is now read from the
+device before the file is generated.
+
+**The managed flag was set at runtime only.** `nmcli device set … managed
+yes` writes to `/run`, so an OVS internal port that NM leaves unmanaged by
+default came back unmanaged at every boot and the keyfile never
+autoconnected. Now persisted in `conf.d`.
+
+**Host routes were installed twice.** NetworkManager and `ip route
+replace` used different metrics, and `replace` matches on *(destination,
+metric)*, so neither owner could see the other's copy. Both now use
+`[setup].host_route_metric`.
+
+**`--install-unit` could be cancelled silently.** `Requires=` on an Open
+vSwitch unit name that does not exist on this distribution fails the job,
+and a cancelled job leaves nothing in `systemctl status`.
+
+**`delete` reported host networking flushed while NetworkManager put it
+straight back.** Step 1 now deactivates the profile first.
+
+**A disabled `pcap` failed the stage.** `--start` with
+`[pcap].enabled: false` now exits 0 instead of aborting, so a host that
+has chosen not to capture stops printing an error and a skipped stage on
+every deploy.
 
 Two behaviours preserved on purpose, both verified by `diagnose`:
 
