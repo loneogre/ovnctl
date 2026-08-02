@@ -506,30 +506,46 @@ class UserVM:
 
     def access_acls(self, name: str, port_uuid: str,
                     access: list[str]) -> None:
-        """Inbound management, scoped to this ONE port.
+        """Inbound management for this ONE port, as a single rule.
 
         The match names the port explicitly rather than the port group:
         every slot is in the same group, so a group-scoped rule would open
         the chosen protocol on all ten. Two slots asking for different
         protocols is the normal case, not the exception.
+
+        Within a slot, though, the protocols differ only in tcp.dst --
+        same direction, priority, action, source and outport -- so they
+        collapse into one ACL with a port set, the way [acls] writes the
+        FreeIPA rules. Four near-identical rows per slot was forty rows
+        for ten slots, all of which had to be read to see what one slot
+        could do.
+
+        Written destructively: the slot's existing access ACLs are removed
+        first. `acl-add --may-exist` keys on the MATCH, so changing a
+        slot's access list would otherwise add a second rule beside the
+        old one and leave both in force -- and with a port set, changing
+        ANY protocol changes the match.
         """
         ctx = self.ctx
-        for proto in access:
-            port = self.ports[proto]
-            ovn.add_acl(
-                ctx, self.pg_name, "to-lport", self.access_priority,
-                f'outport == "{port_uuid}" && ip4 && '
-                f'ip4.src == {self.mgmt_src} && tcp && tcp.dst == {port}',
-                "allow-related",
-                name=f"{_acl_stem(name)}-{proto}-in-{port_uuid[:8]}",
-                log=True, severity="info")
-            ctx.log(f"  {proto.upper()} in from {self.mgmt_src} "
-                    f"(tcp/{port}) -- allowed.")
+        self.del_acl_prefixed(f"{_acl_stem(name)}-")
         if not access:
             ctx.warn(f"{name} has NO management access configured. It can "
                      "reach defended terrain")
             ctx.warn("but nothing can reach it. Re-create with --ssh and/or "
                      "--rdp if that is not what you want.")
+            return
+
+        ports = [self.ports[p] for p in ACCESS_PORTS if p in access]
+        dst = f"{{{','.join(ports)}}}" if len(ports) > 1 else ports[0]
+        ovn.add_acl(
+            ctx, self.pg_name, "to-lport", self.access_priority,
+            f'outport == "{port_uuid}" && ip4 && '
+            f'ip4.src == {self.mgmt_src} && tcp && tcp.dst == {dst}',
+            "allow-related", name=f"{_acl_stem(name)}-access-in",
+            log=True, severity="info")
+        listed = ", ".join(f"{p.upper()}/{self.ports[p]}"
+                           for p in ACCESS_PORTS if p in access)
+        ctx.log(f"  {listed} in from {self.mgmt_src} -- allowed.")
 
     # ------------------------------------------------------------------
     # delete
@@ -550,8 +566,11 @@ class UserVM:
                 return 1
 
         ctx.dr_head(f"Delete {name}")
-        for proto in ACCESS_PORTS:
-            self.del_acl_prefixed(f"{_acl_stem(name)}-{proto}-in")
+        # One prefix, not one per protocol. It matches the collapsed
+        # rule, the old per-protocol rules and the port-suffixed ones a
+        # previous version wrote, so a slot deleted after any of them
+        # leaves nothing behind.
+        self.del_acl_prefixed(f"{_acl_stem(name)}-")
         ctx.run("ovn-nbctl", "--if-exists", "lsp-del", record["uuid"])
 
         remaining = [r["uuid"] for r in self.records() if r["name"] != name]
@@ -585,11 +604,16 @@ class UserVM:
         acl-del matches on direction/priority/match, none of which are
         convenient here, so find the rows by the name we gave them.
 
-        PREFIX, not equality, because the name now ends in the port id.
-        A slot that was rebuilt has ACLs from both generations, and the
-        older ones are still enforced -- deleting only the current port's
-        rules would leave the previous port's access rules behind with
-        nothing to show they exist.
+        PREFIX, not equality. Callers pass the slot stem with its
+        trailing dash, which matches the current `uservmN-access-in`, the
+        older `uservmN-ssh-in` per-protocol rules, and the port-suffixed
+        `uservmN-ssh-in-a1b2c3d4` form in between. A slot deleted after
+        any of them leaves nothing behind.
+
+        The trailing dash is what makes it safe: "uservm10-ssh-in" does
+        not start with "uservm1-", because the next character is a digit
+        and not the dash. Without it, deleting slot 1 would take slot 10's
+        rules with it.
         """
         ctx = self.ctx
         for row in ovn.nb_json(ctx, "_uuid,name", "ACL"):
