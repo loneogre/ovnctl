@@ -678,13 +678,17 @@ def show_topology() -> None:
     inner = _BAR - 4
     art.add(" " * _MARGIN,
             art.cell(rule("┌", "┐", (_CX + _TICK - _MARGIN,), "┴", _BAR), LOG))
+    # Centred like every other box in the drawing. The bar is wider than
+    # the rest, so left-aligning it was the one thing on the page with a
+    # different alignment -- which reads as an accident rather than as
+    # emphasis.
     art.add(" " * _MARGIN, art.cell("│ ", LOG),
-            f"{col.bold}{lr_core.ljust(inner)[:inner]}{RST}",
+            col.bold + art.cell(lr_core, "", inner) + RST,
             art.cell(" │", LOG))
     detail = (f"lrp-uplink {transit_ip} · default 0.0.0.0/0 via {lan_gw} "
               f"· no NAT")
     art.add(" " * _MARGIN, art.cell("│ ", LOG),
-            art.cell(detail, LOG, inner, "left"), art.cell(" │", LOG))
+            art.cell(detail, LOG, inner), art.cell(" │", LOG))
     art.add(" " * _MARGIN,
             art.cell(rule("└", "┘", _BAR_TICKS, "┬", _BAR), LOG))
     check(lr_core, routers)
