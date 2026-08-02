@@ -384,6 +384,24 @@ class UserVM:
 
         self.ensure_segment()
 
+        stale = self.ports_named(name)
+        if stale:
+            raise Abort(
+                f"{name} is free in the tracker but {len(stale)} logical "
+                f"port(s) on {self.switch} are already tagged with it:\n"
+                + "\n".join(f"  {p}" for p in stale)
+                + f"\n\nBuilding another would give one slot two ports and "
+                f"two sets of ACLs, which is what\nan interrupted create "
+                f"leaves behind: the port is wired before the tracker is\n"
+                f"written, so a failure in between is invisible to "
+                f"--list.\n\nClear the orphan first:\n"
+                + "\n".join(f"  ovn-nbctl --if-exists lsp-del {p}"
+                            for p in stale)
+                + f"\n  ovnctl user-vm --reapply     "
+                f"# resync {self.pg_name} membership\n"
+                f"\n`ovnctl acl --verify` lists the ACLs left pointing at "
+                f"it.")
+
         ctx.dr_head(f"Create {name}")
         self.wire_port(name, port_uuid, mac, ip, access)
         self.sync_pg_members(extra=port_uuid)
@@ -405,17 +423,51 @@ class UserVM:
         self.print_instructions(record)
         return 0
 
+    def ports_named(self, name: str) -> list[str]:
+        """Logical ports on the segment already tagged with this slot name.
+
+        The tracker is written after the port is wired, so an interrupted
+        create leaves a port the tracker has never heard of. Asking the db
+        rather than the tracker is the only way to see it.
+        """
+        known = {r["uuid"] for r in self.records()}
+        out: list[str] = []
+        for row in ovn.nb_json(self.ctx, "name,external_ids",
+                               "Logical_Switch_Port"):
+            if len(row) < 2 or not row[0] or row[0] in known:
+                continue
+            if dict(ovn._json_map(row[1])).get("vm-name") == name:
+                out.append(row[0])
+        return out
+
     def wire_port(self, name: str, port_uuid: str, mac: str, ip: str,
                   access: list[str]) -> None:
         """Create the logical port and its per-VM access rules."""
         ctx = self.ctx
         ctx.run("ovn-nbctl", "--may-exist", "lsp-add", self.switch, port_uuid)
-        ctx.run("ovn-nbctl", "lsp-set-addresses", port_uuid, f"{mac} {ip}")
+
+        # CHECK these two. ctx.run does not raise, so a failure here used
+        # to be silent -- and what it leaves behind is a port that exists,
+        # joins the port group and is matched by the isolation ACLs, but
+        # has `dynamic / unset` addresses. It can neither send nor receive,
+        # and because the record is only written at the END of create(),
+        # the tracker never learns about it: the next --create sees the
+        # slot as free and builds a SECOND port for the same name.
+        addr = ctx.run("ovn-nbctl", "lsp-set-addresses", port_uuid,
+                       f"{mac} {ip}")
         # Port security is what stops a user's VM forging a source address.
         # These are machines we do not administer, on a segment whose whole
         # policy is written in terms of ip4.src -- without it, isolation is
         # a suggestion.
-        ctx.run("ovn-nbctl", "lsp-set-port-security", port_uuid, f"{mac} {ip}")
+        sec = ctx.run("ovn-nbctl", "lsp-set-port-security", port_uuid,
+                      f"{mac} {ip}")
+        if not addr or not sec:
+            failed = "addresses" if not addr else "port security"
+            ctx.run("ovn-nbctl", "--if-exists", "lsp-del", port_uuid)
+            raise Abort(
+                f"Could not set {failed} on {name} ({port_uuid}).\n"
+                f"The half-built port has been removed so the slot stays "
+                f"free. Nothing was recorded.")
         ctx.run("ovn-nbctl", "set", "Logical_Switch_Port", port_uuid,
                 f"external-ids:vm-name={name}")
         self.access_acls(name, port_uuid, access)
@@ -468,7 +520,8 @@ class UserVM:
                 ctx, self.pg_name, "to-lport", self.access_priority,
                 f'outport == "{port_uuid}" && ip4 && '
                 f'ip4.src == {self.mgmt_src} && tcp && tcp.dst == {port}',
-                "allow-related", name=f"{_acl_stem(name)}-{proto}-in",
+                "allow-related",
+                name=f"{_acl_stem(name)}-{proto}-in-{port_uuid[:8]}",
                 log=True, severity="info")
             ctx.log(f"  {proto.upper()} in from {self.mgmt_src} "
                     f"(tcp/{port}) -- allowed.")
@@ -498,7 +551,7 @@ class UserVM:
 
         ctx.dr_head(f"Delete {name}")
         for proto in ACCESS_PORTS:
-            self.del_acl_named(f"{_acl_stem(name)}-{proto}-in")
+            self.del_acl_prefixed(f"{_acl_stem(name)}-{proto}-in")
         ctx.run("ovn-nbctl", "--if-exists", "lsp-del", record["uuid"])
 
         remaining = [r["uuid"] for r in self.records() if r["name"] != name]
@@ -526,15 +579,21 @@ class UserVM:
                 "occupant gets a new UUID and MAC.")
         return 0
 
-    def del_acl_named(self, acl_name: str) -> None:
-        """Remove an ACL by its name column.
+    def del_acl_prefixed(self, stem: str) -> None:
+        """Remove every ACL whose name starts with this stem.
 
         acl-del matches on direction/priority/match, none of which are
-        convenient here, so find the row by the name we gave it.
+        convenient here, so find the rows by the name we gave them.
+
+        PREFIX, not equality, because the name now ends in the port id.
+        A slot that was rebuilt has ACLs from both generations, and the
+        older ones are still enforced -- deleting only the current port's
+        rules would leave the previous port's access rules behind with
+        nothing to show they exist.
         """
         ctx = self.ctx
         for row in ovn.nb_json(ctx, "_uuid,name", "ACL"):
-            if len(row) < 2 or str(row[1] or "") != acl_name:
+            if len(row) < 2 or not str(row[1] or "").startswith(stem):
                 continue
             uuids = ovn.uuid_list(row[0])
             if not uuids:
@@ -542,7 +601,7 @@ class UserVM:
             ctx.run("ovn-nbctl", "remove", "port_group", self.pg_name, "acls",
                     uuids[0])
             ctx.run("ovn-nbctl", "--if-exists", "destroy", "acl", uuids[0])
-            ctx.log(f"  removed ACL {acl_name}")
+            ctx.log(f"  removed ACL {row[1]}")
 
     # ------------------------------------------------------------------
     # reapply / list / show
