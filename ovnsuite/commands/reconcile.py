@@ -391,7 +391,28 @@ def _install_unit(ctx: Ctx) -> int:
     return 0
 
 
-def _nm_profile(setup: Setup) -> str:
+def _nm_device_type(ctx: Ctx, iface: str) -> str:
+    """What NetworkManager thinks this device is ('' if it is not there).
+
+    This decides the profile type, and getting it wrong makes the profile
+    unusable rather than merely imperfect: NetworkManager refuses to
+    activate a connection whose type does not match the device's, so an
+    802-3-ethernet profile on a device NM types as `generic` fails with a
+    compatibility error and the interface is left bare.
+
+    An OVS internal port has driver `openvswitch`, which NM does not
+    recognise as ethernet, so it types it `generic` -- unless NM's OVS
+    plugin is loaded and reading ovsdb, in which case it becomes
+    `ovs-interface` and only an ovs-interface profile (with the whole
+    ovs-bridge/ovs-port chain above it) will do.
+    """
+    if not ctx.q("ip", "link", "show", "dev", iface).ok:
+        return ""
+    return ctx.qout("nmcli", "-g", "GENERAL.TYPE", "device", "show",
+                    iface).strip()
+
+
+def _nm_profile(setup: Setup, dev_type: str = "generic") -> str:
     """A NetworkManager keyfile describing host-if's kernel-side state.
 
     The systemd unit reapplies this state once, after boot. A keyfile
@@ -407,17 +428,27 @@ def _nm_profile(setup: Setup) -> str:
     # existing profile rather than leaving a second one beside it.
     profile_uuid = uuid.uuid5(uuid.NAMESPACE_DNS, f"ovnctl.{setup.host_if}")
 
+    ethernet = dev_type == "ethernet"
     lines = [
         "[connection]",
         f"id={setup.host_if}",
         f"uuid={profile_uuid}",
-        "type=ethernet",
+        f"type={'ethernet' if ethernet else 'generic'}",
         f"interface-name={setup.host_if}",
         "autoconnect=true",
         "",
-        "[ethernet]",
-        f"cloned-mac-address={setup.host_if_mac}",
-        "",
+    ]
+    if ethernet:
+        # cloned-mac-address is an 802-3-ethernet property and has no
+        # equivalent on a generic connection. No loss: the MAC lives in
+        # the OVS Interface row, which is where it belongs and which
+        # survives a reboot on its own.
+        lines += [
+            "[ethernet]",
+            f"cloned-mac-address={setup.host_if_mac}",
+            "",
+        ]
+    lines += [
         "[ipv4]",
         "method=manual",
         f"address1={setup.host_if_cidr}",
@@ -494,7 +525,6 @@ def _install_nm_profile(ctx: Ctx) -> int:
 
     setup = Setup(ctx)
     path = NM_PROFILE_DIR / f"{setup.host_if}.nmconnection"
-    content = _nm_profile(setup)
 
     # A profile that creates the device defeats the whole arrangement, and
     # does so silently: everything downstream still looks configured while
@@ -519,6 +549,32 @@ def _install_nm_profile(ctx: Ctx) -> int:
         ctx.err("Rebuild it before installing the profile: "
                 "ovnctl setup --only host-interface")
         return 1
+
+    # The profile type has to match what NM believes the device is, so
+    # this has to happen before the file is generated rather than as a
+    # post-hoc check on an already-written keyfile.
+    dev_type = _nm_device_type(ctx, setup.host_if)
+    if dev_type == "ovs-interface":
+        ctx.err(f"NetworkManager classifies {setup.host_if} as an "
+                "ovs-interface, so it will only accept an ovs-interface "
+                "profile -- which needs an ovs-port and ovs-bridge profile "
+                "above it, handing br-int to NetworkManager.")
+        ctx.err("That is not something to do to an OVN integration bridge.")
+        ctx.err("Use `ovnctl reconcile --install-unit` on this host instead.")
+        return 1
+
+    if not dev_type:
+        ctx.warn(f"{setup.host_if} does not exist yet; assuming NetworkManager "
+                 "will type it 'generic', as it does any openvswitch-driver "
+                 "device.")
+        dev_type = "generic"
+    elif dev_type != "ethernet":
+        # Expected, and worth saying out loud: an 802-3-ethernet profile
+        # on a generic device does not half-work, it refuses to activate.
+        ctx.say(f"NetworkManager types {setup.host_if} as '{dev_type}'; "
+                "writing a generic profile to match.")
+
+    content = _nm_profile(setup, dev_type)
 
     if not setup.host_route_metric:
         # Two owners install these prefixes: this profile and the
@@ -583,41 +639,52 @@ def _install_nm_profile(ctx: Ctx) -> int:
                 "apply this profile as soon as it appears.")
         return 0
 
-    dev_type = ctx.qout("nmcli", "-g", "GENERAL.TYPE", "device", "show",
-                        setup.host_if).strip()
-    if dev_type == "ovs-interface":
-        ctx.warn(f"NetworkManager classifies {setup.host_if} as an "
-                 "ovs-interface, so it will not accept this ethernet profile.")
-        ctx.warn("That happens when NetworkManager's OVS plugin is loaded and "
-                 "reading ovsdb.")
-        ctx.warn("Use `ovnctl reconcile --install-unit` on this host instead.")
+    ctx.run("nmcli", "device", "set", setup.host_if, "managed", "yes")
+    res = ctx.q("nmcli", "connection", "up", setup.host_if)
+    if not res.ok:
+        # The reason is the whole content of this failure and nmcli
+        # already printed it. Repeating the command back at the operator
+        # throws it away and makes them run it a second time to see it.
+        ctx.warn(f"Could not activate {setup.host_if}.")
+        for line in (res.stderr or res.stdout or "").splitlines():
+            if line.strip():
+                ctx.warn(f"  {line.strip()}")
+        if "not compatible" in (res.stderr or "") or "mismatch" in (res.stderr or ""):
+            ctx.warn(f"That is a type mismatch: the profile is "
+                     f"'{'ethernet' if dev_type == 'ethernet' else 'generic'}' "
+                     f"and NetworkManager types the device '{dev_type}'.")
+        ctx.warn("The systemd unit covers this host in the meantime: "
+                 "ovnctl reconcile --install-unit")
         return 1
 
-    ctx.run("nmcli", "device", "set", setup.host_if, "managed", "yes")
-    if ctx.run("nmcli", "connection", "up", setup.host_if):
-        ctx.say(f"Activated {setup.host_if}; it will come up with this address "
-                "and these routes at every boot.")
-        state = ctx.qout("nmcli", "-g", "GENERAL.STATE", "device", "show",
-                         setup.host_if).strip()
-        if "unmanaged" in state.lower():
-            ctx.warn(f"NetworkManager still reports {setup.host_if} as "
-                     f"unmanaged despite {NM_MANAGED_CONF}.")
-            ctx.warn("Check for an unmanaged-devices rule that outranks it: "
-                     "grep -rn unmanaged /etc/NetworkManager /usr/lib/"
-                     "NetworkManager")
-            ctx.warn("Until that is resolved the profile will not autoconnect "
-                     "at boot; install the systemd unit as well: "
-                     "ovnctl reconcile --install-unit")
-        # Rewriting the keyfile drops any hand-added key, but routes an
-        # earlier version of it already installed in the kernel at another
-        # metric are not NM's to remove. reconcile's host-interface step
-        # deletes them.
-        ctx.say("Run `ovnctl reconcile` now to clear any copy of these "
-                "routes left in the kernel at a different metric.")
-    else:
-        ctx.warn(f"Could not activate {setup.host_if} now. Check: "
-                 f"nmcli connection up {setup.host_if}")
-        return 1
+    ctx.say(f"Activated {setup.host_if}; it will come up with this address "
+            "and these routes at every boot.")
+    state = ctx.qout("nmcli", "-g", "GENERAL.STATE", "device", "show",
+                     setup.host_if).strip()
+    if "unmanaged" in state.lower():
+        ctx.warn(f"NetworkManager still reports {setup.host_if} as "
+                 f"unmanaged despite {NM_MANAGED_CONF}.")
+        ctx.warn("Check for an unmanaged-devices rule that outranks it: "
+                 "grep -rn unmanaged /etc/NetworkManager /usr/lib/"
+                 "NetworkManager")
+        ctx.warn("Until that is resolved the profile will not autoconnect "
+                 "at boot; install the systemd unit as well: "
+                 "ovnctl reconcile --install-unit")
+    elif "externally" in state.lower():
+        # NM assumes an "external" connection for a device someone else
+        # configured. It reads as connected while the profile is not in
+        # force, so the device looks fine and still comes back bare.
+        ctx.warn(f"NetworkManager reports {setup.host_if} as connected "
+                 "*externally*, meaning it is describing configuration "
+                 "someone else applied rather than applying this profile.")
+        ctx.warn(f"-> nmcli -g GENERAL.CONNECTION device show {setup.host_if}"
+                 f"   (should read '{setup.host_if}')")
+    # Rewriting the keyfile drops any hand-added key, but routes an
+    # earlier version of it already installed in the kernel at another
+    # metric are not NM's to remove. reconcile's host-interface step
+    # deletes them.
+    ctx.say("Run `ovnctl reconcile` now to clear any copy of these "
+            "routes left in the kernel at a different metric.")
     return 0
 
 
