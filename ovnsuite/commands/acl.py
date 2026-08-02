@@ -36,7 +36,8 @@ from dataclasses import dataclass
 
 from .. import ovn
 from ..context import (Abort, Colour, Ctx, acl_priority_matched,
-                       trace_acl_priorities, trace_verdict)
+                       acl_priority_of, trace_acl_priorities,
+                       trace_verdict)
 from ..inventory import Inventory
 from ..state import ACLS, Tracker, record
 from ..steps import StepRunner, add_step_args
@@ -981,7 +982,7 @@ class ACLManager:
                 results.append((plabel, peer_ip, expect, trace_verdict(out),
                                 trace_acl_priorities(out, side),
                                 trace_acl_priorities(out), out))
-            self._report_case(label, want_prio, results)
+            self._report_case(label, want_prio, results, direction)
         print("")
 
     def _verify_every_rule(self, lrp_int_mac: str, lrp_ext_mac: str) -> None:
@@ -1019,11 +1020,11 @@ class ACLManager:
                                 trace_acl_priorities(out), out))
             label = (f"{rule.name} ({rule.direction} {rule.priority} "
                      f"{rule.action})")
-            self._report_case(label, want_prio, results)
+            self._report_case(label, want_prio, results, rule.direction)
         print("")
 
     def _report_case(self, label: str, want_prio: int,
-                     results: list) -> None:
+                     results: list, direction: str = "") -> None:
         """One line per rule when it is healthy, detail when it is not.
 
         Collapsing the probes is deliberate. A rule with a seven-port set
@@ -1043,6 +1044,7 @@ class ACLManager:
         shadowed = []
         unmeasured = []
         skipped = []
+        unreachable = []
         for plabel, peer_ip, expect, verdict, mine, every, out in results:
             decided_here = [p for p in mine if p > 0]
             decided_any = [p for p in every if p > 0]
@@ -1055,6 +1057,16 @@ class ACLManager:
                 # Our rule matched. Now the verdict has to agree with it.
                 (ok if verdict == expect else bad).append(
                     (plabel, peer_ip, verdict, expect, out))
+            elif (direction == "to-lport" and decided_any
+                  and verdict == "DROP"):
+                # The egress ACLs never ran: something in the INGRESS
+                # pipeline dropped the packet first, and ls_in is
+                # evaluated before ls_out. That says nothing about this
+                # rule -- it says the probe cannot reach it. Counting it
+                # as shadowed blames a rule for not deciding a packet it
+                # was never offered. The usual cause is the paired
+                # from-lport rule at the same priority doing its job.
+                unreachable.append((plabel, peer_ip, max(decided_any)))
             elif decided_any:
                 shadowed.append((plabel, peer_ip, max(decided_any), verdict))
             elif want_prio >= 0:
@@ -1075,7 +1087,13 @@ class ACLManager:
                     print(f"           {line}")
         elif skipped and len(skipped) == n:
             self.v_skip += 1
-            print(f"  {self.tag('skip')} {label:<46} {self.c.dim}{skipped[0][2]}{self.c.rst}")
+            print(f"  {self.tag('skip')} {label:<46} "
+                  f"{self.c.dim}{skipped[0][2]}{self.c.rst}")
+        elif unreachable and not ok and not shadowed:
+            self.v_skip += 1
+            print(f"  {self.tag('skip')} {label:<46} {self.c.dim}"
+                  f"every probe was dropped in ingress -- the egress ACLs "
+                  f"never ran{self.c.rst}")
         elif unmeasured and len(unmeasured) == n:
             self.v_warn += 1
             print(f"  {self.tag('warn')} {label:<46} no verdict (trace failed/timed out)")
@@ -1084,16 +1102,23 @@ class ACLManager:
         elif shadowed:
             self.v_shadow += 1
             first = shadowed[0]
-            where = (f"priority {first[2]}" if first[2]
+            where = (f"priority {acl_priority_of(first[2])}" if first[2]
                      else "no ACL matched")
             print(f"  {self.tag('dead')} {label:<46} {len(shadowed)}/{n} "
                   f"decided by {self.c.mag}{where}{self.c.rst}")
             for plabel, peer_ip, prio, verdict in shadowed[:3]:
-                print(f"         {peer_ip} {plabel}: {verdict} from "
-                      + (f"priority {prio}" if prio else "no ACL"))
+                print(f"         {self.c.dim}{peer_ip} {plabel}: {verdict} "
+                      + (f"from priority {acl_priority_of(prio)}"
+                         if prio else "with no ACL match")
+                      + self.c.rst)
         else:
             self.v_ok += 1
-            extra = f", {len(skipped)} unprobeable" if skipped else ""
+            notes = []
+            if skipped:
+                notes.append(f"{len(skipped)} unprobeable")
+            if unreachable:
+                notes.append(f"{len(unreachable)} never reached egress")
+            extra = ", " + ", ".join(notes) if notes else ""
             print(f"  {self.tag('ok')} {label:<46} {self.c.dim}{len(ok)}/{n} probe(s){extra}{self.c.rst}")
 
     _TAGS = {"ok": ("[ OK ]", "grn", False), "fail": ("[FAIL]", "red", True),
@@ -1220,6 +1245,8 @@ class ACLManager:
                   f"decides anything -- check for a{c.rst}")
             print(f"  {c.dim}higher-priority rule matching the same packets, "
                   f"or raise this rule above it.{c.rst}")
+            print(f"  {c.dim}Priorities are shown as they appear in the yaml, "
+                  f"not as northd's offset flows.{c.rst}")
         print("")
 
         # DEAD does not fail the run. [acls] documents two rules as

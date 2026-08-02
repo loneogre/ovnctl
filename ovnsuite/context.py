@@ -390,6 +390,18 @@ def acl_priority_matched(decided: list[int], priority: int) -> bool:
                for p in decided)
 
 
+def acl_priority_of(flow_priority: int) -> int:
+    """A traced flow priority back in the numbers the yaml uses.
+
+    Reporting the raw flow priority means every message about a rule
+    names a number that appears nowhere in the settings file and is
+    always exactly 1000 higher than the one that does -- which reads as
+    an off-by-1000 bug in the checker even when the check is right.
+    """
+    return (flow_priority - ACL_PRI_OFFSET
+            if flow_priority >= ACL_PRI_OFFSET else flow_priority)
+
+
 def trace_verdict(output: str) -> str:
     """ALLOW / DROP / UNKNOWN from an ovn-trace.
 
