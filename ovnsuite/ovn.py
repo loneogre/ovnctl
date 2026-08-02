@@ -82,41 +82,6 @@ def iface_id_of(ctx: Ctx, iface: str) -> str:
     return res.stdout.strip('"') if res.ok else ""
 
 
-def iface_health(ctx: Ctx, iface: str) -> tuple[int, str]:
-    """(ofport, error) for an OVS interface. ofport -1 means broken.
-
-    ovs-vswitchd fills `ofport` and clears `error` only once it has really
-    opened the netdev. A row can otherwise look entirely correct -- right
-    name, right type, right iface-id -- while the datapath has nothing
-    behind it, and ovn-controller then has no port to bind. `admin_state`
-    reads as the empty set in that state rather than "down", which is easy
-    to skim past; ofport is unambiguous.
-
-    Returns (0, "") when the interface does not exist at all, so callers
-    can tell "no row" from "row with no datapath".
-    """
-    res = ctx.q("ovs-vsctl", "--format=json", "--columns=ofport,error",
-                "list", "Interface", iface)
-    if not res.ok:
-        return 0, ""
-    rows = _json_rows(res.stdout, "ofport,error")
-    if not rows or len(rows[0]) < 2:
-        return 0, ""
-    raw_port, raw_err = rows[0][0], rows[0][1]
-    try:
-        # An unset ofport renders as ["set", []]; a set one as an integer.
-        ofport = int(raw_port) if not isinstance(raw_port, list) else -1
-    except (TypeError, ValueError):
-        ofport = -1
-    error = "" if isinstance(raw_err, list) else str(raw_err or "")
-    return ofport, error
-
-
-def iface_is_healthy(ctx: Ctx, iface: str) -> bool:
-    ofport, _ = iface_health(ctx, iface)
-    return ofport > 0
-
-
 def mirror_exists(ctx: Ctx, name: str) -> bool:
     out = ctx.qout("ovs-vsctl", "--bare", "--columns=_uuid", "find", "Mirror",
                    f"name={name}")

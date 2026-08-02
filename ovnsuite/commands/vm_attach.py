@@ -17,10 +17,9 @@ is reported rather than silently wired to the wrong port.
 from __future__ import annotations
 
 import argparse
-import json
 import time
 
-from .. import libvirtutil, ovn, paths
+from .. import inventory, libvirtutil, ovn
 from ..context import Abort, Ctx
 from ..inventory import VM, Inventory
 from ..steps import StepRunner, add_step_args
@@ -28,39 +27,13 @@ from ..steps import StepRunner, add_step_args
 NAME = "vm-attach"
 HELP = "re-attach running VM taps to br-int"
 
-
-def _user_vm_records(ctx: Ctx) -> list[VM]:
-    """user-vm slots, read from their allocation file.
-
-    They live outside [vm_config] because they are allocated at runtime
-    rather than declared, but as far as this command is concerned they are
-    ordinary VMs with a MAC and a logical port. Read the file directly --
-    importing the user-vm command here would be a circular dependency for
-    the sake of four fields.
-    """
-    path = paths.state_dir() / "user-vms.json"
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return []
-    out: list[VM] = []
-    for record in (data.get("slots") or {}).values():
-        if not record.get("mac") or not record.get("uuid"):
-            continue
-        out.append(VM(name=record.get("name", "user-vm"),
-                      uuid=record["uuid"], mac=record["mac"],
-                      ip=record.get("ip", ""), group="user", switch=""))
-    return sorted(out, key=lambda v: v.name)
-
 # How long to wait for ovn-controller to claim a freshly attached port.
 #
 # This used to be a flat 3-second sleep followed by an immediate status
 # print, which is why `ovnctl deploy` could report every VM as
 # "DOWN (no chassis)" on a deployment that was in fact fine thirty seconds
-# later. Claiming is not instant, and it is slowest in exactly the case
-# where this command matters most: right after `delete --purge-db`, when
-# ovn-controller is rebuilding its whole view and computing several
-# hundred thousand flows.
+# later. Claiming is not instant, and it is slowest right after
+# `delete --purge-db`, when ovn-controller is rebuilding its whole view.
 DEFAULT_TIMEOUT = 60
 
 
@@ -107,7 +80,7 @@ class VMAttach:
         # a user VM's tap has a MAC this command cannot match, so it is
         # reported as "not in the inventory" and never attached: the one
         # class of VM whose owner is least able to debug it.
-        self.vms = list(self.inv.all) + _user_vm_records(ctx)
+        self.vms = list(self.inv.all) + inventory.user_vm_slots()
         extra = len(self.vms) - len(self.inv.all)
         ctx.log(f"Loaded {len(self.inv.all)} VMs from the inventory"
                 + (f" and {extra} user-vm slot(s)." if extra else "."))
@@ -467,6 +440,14 @@ class VMAttach:
         the one that matters.
         """
         ctx = self.ctx
+        # A live-state report, not a command. Under --dry-run it would be
+        # printed into `ovnctl runbook`'s output, which captures stdout to
+        # build a shell script -- a table of port bindings in the middle of
+        # one is at best confusing and at worst breaks it.
+        if ctx.dry_run:
+            ctx.log("(status table omitted in dry-run: it reports live state, "
+                    "not commands)")
+            return
         chassis_names = ovn.chassis_uuid_names(ctx)
         print("")
         print("=== Port binding status ===")

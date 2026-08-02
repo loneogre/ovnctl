@@ -97,10 +97,6 @@ class Setup:
         routes = c.cfg_array("setup", "host_routes")
         self.host_routes = routes if routes else [c.cfg("setup", "remote_subnet")]
 
-        # Only consulted when writing the NetworkManager profile; the
-        # `ip route` path leaves the metric to the kernel, as it always has.
-        self.host_route_metric = c.cfg_opt("setup", "host_route_metric")
-
     # -- 1 ---------------------------------------------------------------
     def external_ids(self) -> None:
         """Reconcile external-ids -- every key, every run.
@@ -362,7 +358,12 @@ class Setup:
                         "(it was on another switch)...")
                 ctx.run("ovn-nbctl", "--if-exists", "lsp-del", self.host_if)
 
-        self._ensure_ovs_port()
+        if not ctx.q("ovs-vsctl", "port-to-br", self.host_if).ok:
+            ctx.run("ovs-vsctl", "add-port", self.br_int, self.host_if,
+                    "--", "set", "interface", self.host_if, "type=internal",
+                    f'mac="{self.host_if_mac}"')
+        else:
+            ctx.log(f"OVS port {self.host_if} already exists, skipping add-port.")
 
         ctx.run("ovn-nbctl", "--may-exist", "lsp-add", self.ls_host, self.host_if)
         ctx.run("ovn-nbctl", "lsp-set-addresses", self.host_if,
@@ -379,120 +380,6 @@ class Setup:
             return
 
         self._verify_and_report()
-
-    # Kernel device kinds that are safe to delete in order to free the
-    # host_if name. They are placeholders: nothing can be reached through
-    # one, so a device of this kind wearing the name can only ever be
-    # something left behind. Anything else -- a bridge, a bond, a VLAN, a
-    # physical NIC -- might be carrying real traffic, so we refuse rather
-    # than guess.
-    PLACEHOLDER_KINDS = ("dummy", "veth")
-
-    def _link_kind(self) -> str:
-        """The kernel's device kind for host_if ('' if it does not exist).
-
-        `ip -d link show` names the kind on the third line: 'openvswitch'
-        for a real OVS internal port, 'dummy' for a placeholder, and so
-        on. The distinction matters because the name is a single global
-        namespace -- whoever creates a device called host-if first owns
-        it, and ovs-vswitchd cannot then create its internal port.
-        """
-        res = self.ctx.q("ip", "-d", "link", "show", "dev", self.host_if)
-        if not res.ok:
-            return ""
-        known = ("openvswitch", "dummy", "veth", "bridge", "bond", "vlan",
-                 "tun", "vxlan", "macvlan", "team", "geneve")
-        for line in res.stdout.splitlines()[1:]:
-            for token in line.split():
-                if token in known:
-                    return token
-        return "unknown"
-
-    def _reclaim_name(self) -> None:
-        """Free the host_if name if a non-OVS device is holding it.
-
-        This is the failure this whole step used to walk straight past. A
-        device called host-if that ovs-vswitchd did not create makes
-        `add-port ... type=internal` fail with
-
-            could not add network device host-if to ofproto (File exists)
-
-        and vswitchd leaves the row in place with ofport -1, admin_state
-        unset and error set. Everything downstream then looks healthy --
-        the port is on br-int, the iface-id is right, the address and the
-        routes apply to the kernel device that IS there -- while
-        ovn-controller has no ofport to bind and the host can reach
-        nothing. A NetworkManager profile that creates a device (dummy,
-        bridge, bond) is the usual way to end up here, and it recreates
-        the device at every boot, so this has to be handled rather than
-        reported once.
-        """
-        ctx = self.ctx
-        kind = self._link_kind()
-        if kind in ("", "openvswitch"):
-            return
-
-        if kind not in self.PLACEHOLDER_KINDS:
-            raise Abort(
-                f"a {kind} device named '{self.host_if}' already exists, so "
-                f"ovs-vswitchd cannot create its internal port of that name.\n"
-                f"It is not a placeholder, so it will not be removed "
-                f"automatically. Inspect it (ip -d link show {self.host_if}), "
-                f"remove or rename it, then re-run.")
-
-        ctx.warn(f"A {kind} device named '{self.host_if}' is holding the name; "
-                 "ovs-vswitchd cannot create its internal port while it exists.")
-        ctx.warn("Removing it. If something recreates it at boot -- typically a "
-                 "NetworkManager profile of that type -- delete that profile "
-                 f"too: nmcli -f NAME,TYPE,DEVICE connection show | grep {self.host_if}")
-        ctx.run("ip", "link", "del", self.host_if)
-
-    def _ensure_ovs_port(self) -> None:
-        """Create the internal port, and rebuild it if it is not working.
-
-        The old shape of this was `if port-to-br fails: add-port, else:
-        skip`. Presence of the port row is not the same thing as a working
-        interface, so once a broken row existed nothing here would ever
-        rebuild it -- setup and reconcile both re-asserted the iface-id on
-        a dead row for as long as anyone cared to re-run them.
-        """
-        ctx = self.ctx
-        exists = ctx.q("ovs-vsctl", "port-to-br", self.host_if).ok
-
-        if exists:
-            ofport, error = ovn.iface_health(ctx, self.host_if)
-            if ofport > 0:
-                ctx.log(f"OVS port {self.host_if} exists and is healthy "
-                        f"(ofport {ofport}), skipping add-port.")
-                return
-            ctx.warn(f"OVS port {self.host_if} exists but has no datapath "
-                     f"(ofport {ofport}). Rebuilding it.")
-            if error:
-                ctx.warn(f"ovs-vswitchd reports: {error}")
-            ctx.run("ovs-vsctl", "--if-exists", "del-port", self.br_int,
-                    self.host_if)
-
-        # Only now, with the OVS row gone, is a leftover device of that
-        # name unambiguously not ours to keep.
-        self._reclaim_name()
-
-        ctx.run("ovs-vsctl", "add-port", self.br_int, self.host_if,
-                "--", "set", "interface", self.host_if, "type=internal",
-                f'mac="{self.host_if_mac}"')
-
-        if ctx.dry_run:
-            return
-
-        ofport, error = ovn.iface_health(ctx, self.host_if)
-        if ofport > 0:
-            return
-        ctx.warn(f"{self.host_if} still has no datapath after being recreated "
-                 f"(ofport {ofport}).")
-        if error:
-            ctx.warn(f"ovs-vswitchd reports: {error}")
-        ctx.warn("ovn-controller cannot bind a port with no ofport, so the "
-                 "host will not reach anything through it.")
-        ctx.warn(f"-> ip -d link show {self.host_if}   (what else owns the name?)")
 
     def _kernel_mac(self) -> str:
         out = self.ctx.qout("ip", "-o", "link", "show", "dev", self.host_if)
@@ -535,61 +422,16 @@ class Setup:
             ctx.log(f"Address {self.host_if_cidr} already assigned to "
                     f"{self.host_if}, skipping.")
 
-    def _route_metrics(self, net: str) -> list[str]:
-        """Every metric at which `net` currently exists on host_if.
-
-        A route with no metric is metric 0; report it as such so the
-        caller can compare it against a configured value.
-        """
-        found: list[str] = []
-        out = self.ctx.qout("ip", "route", "show", net, "dev", self.host_if)
-        for line in out.splitlines():
-            parts = line.split()
-            if not parts:
-                continue
-            if "metric" in parts:
-                idx = parts.index("metric")
-                if idx + 1 < len(parts):
-                    found.append(parts[idx + 1])
-                    continue
-            found.append("0")
-        return found
-
     def _add_routes(self) -> None:
         """host-if is no longer on the VM segment, so every internal
-        destination is now a routed hop via the router port.
-
-        `ip route replace` matches on (destination, metric), so a copy of
-        a prefix installed at any OTHER metric is invisible to it and
-        survives beside the one written here -- which is exactly what a
-        NetworkManager profile (550 by default on an OVS internal port)
-        and this function (metric 0) did to each other, one extra pair of
-        routes per prefix per reconcile. Delete the strays first, then
-        write the canonical route at the configured metric so that the
-        two paths address the same route and `replace` really replaces.
-        """
+        destination is now a routed hop via the router port."""
         ctx = self.ctx
-        metric = str(self.host_route_metric).strip() if self.host_route_metric else ""
-        want = metric or "0"
-
         for net in self.host_routes:
             if not net.strip():
                 continue
-
-            for existing in self._route_metrics(net):
-                if existing != want:
-                    ctx.log(f"Removing duplicate route {net} dev {self.host_if} "
-                            f"at metric {existing}.")
-                    ctx.run("ip", "route", "del", net, "dev", self.host_if,
-                            "metric", existing)
-
-            cmd = ["ip", "route", "replace", net, "via", self.host_gw,
-                   "dev", self.host_if]
-            if metric:
-                cmd += ["metric", metric]
-            ctx.run(*cmd)
-            suffix = f" metric {metric}" if metric else ""
-            ctx.log(f"Route {net} via {self.host_gw} dev {self.host_if}{suffix}")
+            ctx.run("ip", "route", "replace", net, "via", self.host_gw,
+                    "dev", self.host_if)
+            ctx.log(f"Route {net} via {self.host_gw} dev {self.host_if}")
 
     def _verify_and_report(self) -> None:
         ctx = self.ctx

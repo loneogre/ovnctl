@@ -43,6 +43,7 @@ from pathlib import Path
 
 from .. import libvirtutil, ovn
 from ..context import Abort, Ctx
+from .. import inventory
 from ..inventory import VM, Inventory
 from ..steps import add_step_args
 
@@ -202,9 +203,35 @@ class Pcap:
 
     # ------------------------------------------------------------------
     def _load_targets(self) -> list[VM]:
-        vms = self.inv.select(self.targets)
+        """Resolve pcap.targets, which may combine selectors with '+'.
+
+        'user-vms' is not an inventory selector -- those slots live in
+        state/user-vms.json rather than [vm_config] -- so it is handled
+        separately and unioned in. '+' is the combiner rather than ','
+        because a selector can itself contain commas (names=a,b).
+        """
+        seen: set[str] = set()
+        vms: list[VM] = []
+        for part in [p.strip() for p in self.targets.split("+") if p.strip()]:
+            if part in ("user-vms", "user_vms"):
+                found = inventory.user_vm_slots()
+                if not found:
+                    self.ctx.log("pcap.targets includes 'user-vms' but no "
+                                 "slots are allocated yet.")
+            else:
+                found = self.inv.select(part)
+            for vm in found:
+                if vm.uuid not in seen:
+                    seen.add(vm.uuid)
+                    vms.append(vm)
+
         if not vms:
-            raise Abort(f"No VMs matched pcap.targets='{self.targets}'.")
+            raise Abort(
+                f"No VMs matched pcap.targets='{self.targets}'.\n"
+                "Selectors: all | internal | external | isolated | "
+                "all-except-isolated | user-vms | names=... | ips=...\n"
+                "Combine them with '+', e.g. targets: isolated+user-vms"
+            )
         return vms
 
     def _load_name_map(self) -> dict[str, str]:

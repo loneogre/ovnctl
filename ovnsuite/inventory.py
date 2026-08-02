@@ -13,10 +13,51 @@ Selectors accepted wherever a group of VMs is named:
 
 from __future__ import annotations
 
+import json
+
 from dataclasses import dataclass
 
 from .config import Config
 from .context import Abort
+
+
+#: Where `ovnctl user-vm` records its slot allocations. Read from here by
+#: anything that needs to treat those slots as ordinary VMs -- they are
+#: allocated at runtime rather than declared in [vm_config], but they have
+#: a name, a uuid, a MAC and an address like everything else.
+USER_VM_STATE = "user-vms.json"
+
+
+def user_vm_slots() -> list["VM"]:
+    """Allocated user-VM slots as VM records ([] if none).
+
+    Lives here rather than in one of the commands so that vm-attach and
+    pcap read the same list. Two copies of this loader would eventually
+    disagree about which slots exist, and the symptom -- a VM that is
+    captured but not attached, or vice versa -- would be baffling.
+    """
+    from . import paths
+
+    path = paths.state_dir() / USER_VM_STATE
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    out: list[VM] = []
+    for record in (data.get("slots") or {}).values():
+        if not record.get("uuid") or not record.get("mac"):
+            continue
+        out.append(VM(name=record.get("name", "user-vm"),
+                      uuid=record["uuid"], mac=record["mac"],
+                      ip=record.get("ip", ""), group="user",
+                      switch=record.get("switch", "")))
+    return sorted(out, key=lambda v: _slot_order(v.name))
+
+
+def _slot_order(name: str) -> tuple[str, int]:
+    """user-vm10 sorts after user-vm9, not between 1 and 2."""
+    digits = "".join(c for c in name if c.isdigit())
+    return (name.rstrip("0123456789"), int(digits) if digits else 0)
 
 
 @dataclass(frozen=True)

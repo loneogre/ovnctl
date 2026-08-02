@@ -78,35 +78,6 @@ setup:
     - "172.31.1.32/28"
     - "172.31.0.0/27"
 
-  # Metric for the routes above, on BOTH paths that install them: the
-  # NetworkManager profile written by `--install-nm-profile` and the
-  # `ip route replace` that setup and reconcile run.
-  #
-  # This is not cosmetic. `ip route replace` matches on (destination,
-  # metric), so the two paths only agree that they are talking about the
-  # same route if they use the same number. Left unset, NetworkManager
-  # picks 550 for an OVS internal port -- its fallback for a device type
-  # it does not recognise as ethernet -- while the kernel gives an
-  # unqualified `ip route` metric 0, and every prefix ends up installed
-  # twice, once by each owner, with reconcile unable to see or replace
-  # NM's copy.
-  #
-  # Set it whenever the NetworkManager profile is in use. Any value works
-  # as long as it is the same on both sides; 100 matches the usual metric
-  # of a NM-managed ethernet uplink.
-  host_route_metric: 100
-
-  # Metric for the routes in the NetworkManager profile written by
-  # `ovnctl reconcile --install-nm-profile`. Unset means "let
-  # NetworkManager choose", which for an OVS internal port is 550 --
-  # NM's fallback for a device type it does not recognise as ethernet.
-  #
-  # Nothing above depends on this. Each of these prefixes has exactly one
-  # route, and a metric only breaks ties between routes to the SAME
-  # prefix, so 550 is cosmetic. Set it when you want the numbers to be
-  # deterministic rather than a side effect of NM's device typing.
-  # host_route_metric: 100
-
   # Legacy single-route fields, still honoured if host_routes is absent.
   remote_subnet: 172.31.1.32/28
   remote_gw: 172.31.1.10
@@ -681,17 +652,31 @@ vm_names:
 # it there is nothing to mirror and --start refuses rather than creating
 # ports that would capture nothing.
 #
-# targets: the same selector syntax as [acls].port_groups --
+# targets: which VMs to mirror.
 #
 #   all | internal | external | isolated | all-except-isolated
 #   names=ext-vm1,int-vm3        specific VMs from [vm_config]
 #   ips=172.31.1.34              the same, by address
+#   user-vms                     every allocated `ovnctl user-vm` slot
 #
-# 'isolated' tracks [vm_isolation].isolated_vms, so a VM added there is
-# captured from the next --start with no change here. Use names= or ips=
-# when the capture set is deliberately NOT the isolation set -- e.g.
-# capturing one VM during an investigation without isolating it, or
-# isolating a VM you have no reason to record.
+# COMBINE WITH '+', not a comma -- a selector can contain commas itself:
+#
+#   targets: isolated+user-vms
+#   targets: isolated+names=int-vm3
+#
+# 'isolated' tracks [vm_isolation].isolated_vms and 'user-vms' tracks
+# state/user-vms.json, so a VM added to either is captured from the next
+# --start with no change here. A slot that has not been created yet is
+# simply not in the set; nothing fails.
+#
+# Use names= or ips= when the capture set is deliberately NOT the
+# isolation set -- capturing one VM during an investigation without
+# isolating it, or isolating a VM you have no reason to record.
+#
+# Capturing user-VM slots is worth thinking about before enabling: they
+# are machines we do not administer, and their traffic may include their
+# owners' credentials to third-party systems. Capture them because the
+# engagement calls for it, not by default.
 #          names=ext-vm3,ext-vm4   ips=172.31.1.36,172.31.1.37
 #
 # Layout with subdirs enabled:
@@ -735,6 +720,7 @@ pcap:
   inflight_dir: inflight
   completed_dir: completed
   # Currently: ext-vm1, ext-vm3, ext-vm4, ext-vm5, ext-vm6.
+  # Add the self-service slots with:  targets: isolated+user-vms
   targets: isolated
   snaplen: 0                # 0 = whole packet; 96 for headers only
   filter: ""                # optional BPF, e.g. "not port 22"

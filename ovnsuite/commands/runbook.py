@@ -107,6 +107,56 @@ def _strip_comments(body: str) -> str:
     return "\n".join(keep)
 
 
+#: Executables the suite emits under --dry-run. Anything else on stdout is
+#: a command module reporting rather than instructing.
+_COMMANDS = (
+    "ovn-nbctl", "ovn-sbctl", "ovn-appctl", "ovn-trace", "ovn-ctl",
+    "ovs-vsctl", "ovs-ofctl", "ovs-appctl",
+    "ip", "nmcli", "systemctl", "sysctl", "modprobe", "ethtool",
+    "tcpdump", "mkdir", "rm", "cat", "tee", "printf", "echo", "chmod",
+    "setfacl", "getfacl", "virsh", "pkill", "kill", "sleep", "test",
+)
+
+
+def _comment_prose(body: str) -> str:
+    """Comment out anything that is not a command.
+
+    A command module under --dry-run prints the commands it would run,
+    but some of them ALSO print reports -- status tables, summaries --
+    straight to stdout. Captured verbatim those land in the middle of a
+    generated shell script.
+
+    They are commented rather than dropped. Losing a line silently from a
+    document whose entire purpose is "these are the exact commands" is
+    worse than carrying a marked-up one, and it would be invisible: the
+    reader has no way to know something was removed.
+    """
+    out: list[str] = []
+    in_heredoc = False
+    for line in body.splitlines():
+        stripped = line.strip()
+
+        if in_heredoc:
+            out.append(line)
+            if stripped == "EOF":
+                in_heredoc = False
+            continue
+
+        if not stripped or stripped.startswith("#"):
+            out.append(line)
+            continue
+
+        first = stripped.split(None, 1)[0].split("=", 1)[0]
+        if first in _COMMANDS:
+            out.append(line)
+            if "<<'EOF'" in line or '<<"EOF"' in line or "<<EOF" in line:
+                in_heredoc = True
+            continue
+
+        out.append(f"#   [report] {stripped}")
+    return "\n".join(out)
+
+
 def _chassis_id() -> str:
     try:
         res = subprocess.run(
@@ -186,6 +236,7 @@ class Runbook:
         for argv, description in steps:
             label = "ovnctl " + " ".join(argv)
             body, rc = _capture(argv, self.passthru)
+            body = _comment_prose(body)
             if rc != 0 and not body.strip():
                 if self.header:
                     self.emit(
