@@ -35,7 +35,7 @@ import re
 from dataclasses import dataclass
 
 from .. import ovn
-from ..context import (Abort, Ctx, acl_priority_matched,
+from ..context import (Abort, Colour, Ctx, acl_priority_matched,
                        trace_acl_priorities, trace_verdict)
 from ..inventory import Inventory
 from ..state import ACLS, Tracker, record
@@ -148,6 +148,7 @@ class ACLManager:
         self.v_ok = self.v_fail = self.v_warn = self.v_shadow = 0
         self.v_skip = 0
         self.quick_verify = False
+        self.c = Colour()
 
     @staticmethod
     def _split2(entry: str) -> tuple[str, str]:
@@ -946,7 +947,7 @@ class ACLManager:
                 for uuid in self._ovsdb_set(row[1]):
                     owner[uuid] = row[0]
 
-        print("  --- deployed ACLs not declared in [acls].rules ---")
+        print(f"  {self.c.bold}--- deployed ACLs not declared in [acls].rules ---{self.c.rst}")
         ports, by_ip = self._db_ports()
         lrp_mac = self._switch_lrp_mac()
 
@@ -962,7 +963,7 @@ class ACLManager:
                                                ports, by_ip)
             if skip:
                 self.v_skip += 1
-                print(f"  [SKIP] {label:<46} {skip}")
+                print(f"  {self.tag('skip')} {label:<46} {self.c.dim}{skip}{self.c.rst}")
                 continue
 
             expect = "DROP" if action in ("drop", "reject") else "ALLOW"
@@ -989,7 +990,7 @@ class ACLManager:
             print("  (no rules configured)")
             return
 
-        print("  --- per-rule coverage (generated from [acls].rules) ---")
+        print(f"  {self.c.bold}--- per-rule coverage (generated from [acls].rules) ---{self.c.rst}")
         by_ip = {vm.ip: vm for vm in self.inv.all if vm.ip}
         lrp_mac = dict(self._switch_lrp_mac())
         lrp_mac.setdefault(self.ls_int, lrp_int_mac)
@@ -998,7 +999,7 @@ class ACLManager:
             probes, skip = self._rule_probes(rule)
             if skip:
                 self.v_skip += 1
-                print(f"  [SKIP] {rule.name:<46} {skip}")
+                print(f"  {self.tag('skip')} {rule.name:<46} {self.c.dim}{skip}{self.c.rst}")
                 continue
 
             expect = "DROP" if rule.action in ("drop", "reject") else "ALLOW"
@@ -1066,7 +1067,7 @@ class ACLManager:
         n = len(results)
         if bad:
             self.v_fail += 1
-            print(f"  [FAIL] {label:<46} {len(bad)}/{n} probes wrong")
+            print(f"  {self.tag('fail')} {label:<46} {len(bad)}/{n} probes wrong")
             for plabel, peer_ip, verdict, expect, out in bad[:3]:
                 print(f"         {peer_ip} {plabel}: {verdict}, "
                       f"expected {expect}")
@@ -1074,10 +1075,10 @@ class ACLManager:
                     print(f"           {line}")
         elif skipped and len(skipped) == n:
             self.v_skip += 1
-            print(f"  [SKIP] {label:<46} {skipped[0][2]}")
+            print(f"  {self.tag('skip')} {label:<46} {self.c.dim}{skipped[0][2]}{self.c.rst}")
         elif unmeasured and len(unmeasured) == n:
             self.v_warn += 1
-            print(f"  [WARN] {label:<46} no verdict (trace failed/timed out)")
+            print(f"  {self.tag('warn')} {label:<46} no verdict (trace failed/timed out)")
             for line in (unmeasured[0][2].splitlines()[-4:] or ["(no output)"]):
                 print(f"         {line}")
         elif shadowed:
@@ -1085,15 +1086,50 @@ class ACLManager:
             first = shadowed[0]
             where = (f"priority {first[2]}" if first[2]
                      else "no ACL matched")
-            print(f"  [DEAD] {label:<46} {len(shadowed)}/{n} decided by "
-                  f"{where}")
+            print(f"  {self.tag('dead')} {label:<46} {len(shadowed)}/{n} "
+                  f"decided by {self.c.mag}{where}{self.c.rst}")
             for plabel, peer_ip, prio, verdict in shadowed[:3]:
                 print(f"         {peer_ip} {plabel}: {verdict} from "
                       + (f"priority {prio}" if prio else "no ACL"))
         else:
             self.v_ok += 1
             extra = f", {len(skipped)} unprobeable" if skipped else ""
-            print(f"  [ OK ] {label:<46} {len(ok)}/{n} probe(s){extra}")
+            print(f"  {self.tag('ok')} {label:<46} {self.c.dim}{len(ok)}/{n} probe(s){extra}{self.c.rst}")
+
+    _TAGS = {"ok": ("[ OK ]", "grn", False), "fail": ("[FAIL]", "red", True),
+             "warn": ("[WARN]", "ylw", False), "dead": ("[DEAD]", "mag", False),
+             "skip": ("[SKIP]", "dim", False)}
+
+    def tag(self, kind: str) -> str:
+        """A coloured status tag, matching --audit's palette exactly.
+
+        The colour wraps the tag only, never the padded label. Escape
+        codes inside an f-string field width count toward that width, so
+        colouring the label instead would shorten every line by the
+        length of the escape sequence and stagger the column.
+        """
+        text, colour, bold = self._TAGS[kind]
+        c = self.c
+        return f"{getattr(c, colour)}{c.bold if bold else ''}{text}{c.rst}"
+
+    def _check(self, label: str, expect: str, datapath: str, expr: str) -> None:
+        c = self.c
+        out = ovn.trace(self.ctx, datapath, expr)
+        verdict = trace_verdict(out)
+        if verdict == expect:
+            print(f"  {self.tag('ok')} {label:<46} {c.dim}{verdict}{c.rst}")
+        elif verdict == "UNKNOWN":
+            # Not a failure of the policy -- a failure to measure it.
+            # Printing FAIL here would send you to fix a rule that is fine.
+            print(f"  {self.tag('warn')} {label:<46} "
+                  f"no verdict (trace failed/timed out)")
+            for line in (out.splitlines()[-6:] or ["(no output)"]):
+                print(f"         {c.dim}{line}{c.rst}")
+        else:
+            print(f"  {self.tag('fail')} {label:<46} {c.red}{verdict}{c.rst} "
+                  f"(expected {expect})")
+            for line in out.splitlines()[-6:]:
+                print(f"         {c.dim}{line}{c.rst}")
 
     def do_verify(self) -> int:
         ctx = self.ctx
@@ -1117,7 +1153,7 @@ class ACLManager:
         lrp_ext_mac = ctx.cfg("setup", "lrp_ext_mac")
 
         print("")
-        print("=== ACL verification ===")
+        print(f"{self.c.bold}=== ACL verification ==={self.c.rst}")
 
         # Management SSH in -- must be allowed.
         self._check(f"host {host_ip} -> {v1.name} :22", "ALLOW", self.ls_int,
@@ -1168,14 +1204,22 @@ class ACLManager:
                     f'ip4.dst==203.0.113.10 && ip.ttl==64 && tcp && tcp.dst==22')
 
         total = self.v_ok + self.v_fail + self.v_warn + self.v_shadow
-        print(f"  {total} rule(s) exercised: {self.v_ok} ok, "
-              f"{self.v_fail} failed, {self.v_shadow} dead/shadowed, "
-              f"{self.v_warn} unmeasured, {self.v_skip} skipped")
+        c = self.c
+        def n(count: int, colour: str) -> str:
+            # A zero is good news for every counter but the first, so
+            # only colour the ones that are actually saying something.
+            return f"{colour}{count}{c.rst}" if count else str(count)
+        print(f"  {c.bold}{total} rule(s) exercised{c.rst}: "
+              f"{n(self.v_ok, c.grn)} ok, "
+              f"{n(self.v_fail, c.red)} failed, "
+              f"{n(self.v_shadow, c.mag)} dead/shadowed, "
+              f"{n(self.v_warn, c.ylw)} unmeasured, "
+              f"{n(self.v_skip, c.dim)} skipped")
         if self.v_fail or self.v_shadow:
-            print("  A DEAD rule is deployed correctly but never decides "
-                  "anything -- check for a")
-            print("  higher-priority rule matching the same packets, or "
-                  "raise this rule above it.")
+            print(f"  {c.dim}A DEAD rule is deployed correctly but never "
+                  f"decides anything -- check for a{c.rst}")
+            print(f"  {c.dim}higher-priority rule matching the same packets, "
+                  f"or raise this rule above it.{c.rst}")
         print("")
 
         # DEAD does not fail the run. [acls] documents two rules as
@@ -1193,7 +1237,7 @@ class ACLManager:
         """
         if not self.verify_pairs:
             return
-        print("  --- configured checks ---")
+        print(f"  {self.c.bold}--- configured checks ---{self.c.rst}")
         for pair in self.verify_pairs:
             parts = pair.split()
             if len(parts) < 6:
@@ -1210,7 +1254,7 @@ class ACLManager:
                 # trace enters the DESTINATION switch via its router port
                 # with a decremented TTL.
                 if dst_vm is None:
-                    print(f"  [SKIP] {pname:<46} neither {psrc} nor {pdst} is a VM")
+                    print(f"  {self.tag('skip')} {pname:<46} {self.c.dim}neither {psrc} nor {pdst} is a VM{self.c.rst}")
                     continue
                 datapath = dst_vm.switch
                 inport = f"{dst_vm.switch}-to-lr"
@@ -1236,7 +1280,7 @@ class ACLManager:
             elif pproto == "icmp":
                 proto = "icmp4"
             else:
-                print(f"  [SKIP] {pname:<46} unknown protocol {pproto}")
+                print(f"  {self.tag('skip')} {pname:<46} {self.c.dim}unknown protocol {pproto}{self.c.rst}")
                 continue
 
             src_label = src_vm.name if src_vm else psrc
