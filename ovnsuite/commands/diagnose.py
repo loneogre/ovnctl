@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import re
+from pathlib import Path
 
 from .. import identity, netcalc, ovn
 from ..context import Colour, Ctx
@@ -1349,6 +1350,78 @@ class Diagnose:
             self.detail("Addresses and routes on an OVS internal port are kernel",
                         "state and are lost at every reboot.",
                         "-> ovnctl reconcile")
+            return
+
+        self._check_persistence()
+
+    def _check_persistence(self) -> None:
+        """Is anything going to reapply this at the next boot?
+
+        The interface being correct right now says nothing about whether
+        it will be correct after a reboot, and that is the failure people
+        actually hit: everything green, reboot, host-if bare again. Two
+        mechanisms can prevent it and neither is visible from the
+        interface state, so check for them explicitly rather than let a
+        fully green section 7 imply a persistence that is not there.
+        """
+        ctx = self.ctx
+        keyfile = Path("/etc/NetworkManager/system-connections") / \
+            f"{self.host_if}.nmconnection"
+        managed_conf = Path("/etc/NetworkManager/conf.d/99-ovnctl-host-if.conf")
+        unit = Path("/etc/systemd/system/ovn-reconcile.service")
+
+        unit_armed = unit.exists() and ctx.q(
+            "systemctl", "is-enabled", "ovn-reconcile.service").ok
+
+        if not keyfile.exists():
+            if unit_armed:
+                self.ok("ovn-reconcile.service is enabled; it will reapply this "
+                        "at boot.")
+            else:
+                self.bad("Nothing will reapply this configuration after a reboot.")
+                self.detail(
+                    "No NetworkManager keyfile and no enabled ovn-reconcile.service.",
+                    f"{self.host_if} will come back with no address and no routes.",
+                    "-> ovnctl reconcile --install-nm-profile",
+                    "-> ovnctl reconcile --install-unit")
+            return
+
+        # A keyfile only autoconnects if NetworkManager is willing to
+        # manage the device, and it will not manage an OVS internal port
+        # unless told to. `nmcli device set ... managed yes` writes to
+        # /run, so it is gone by the next boot -- the flag has to be in
+        # conf.d to survive, and a keyfile without it is the exact shape
+        # of "works until you reboot".
+        state = ctx.qout("nmcli", "-g", "GENERAL.STATE", "device", "show",
+                         self.host_if).strip().lower()
+        if "unmanaged" in state:
+            self.bad(f"NetworkManager keyfile exists but {self.host_if} is "
+                     "unmanaged.")
+            self.detail(
+                "An unmanaged device never autoconnects, so the keyfile does",
+                "nothing at boot.",
+                f"-> ovnctl reconcile --install-nm-profile   (writes {managed_conf})")
+            return
+
+        if not managed_conf.exists():
+            self.note(f"Keyfile is present and {self.host_if} is managed, but "
+                      f"{managed_conf.name} is missing.")
+            self.detail(
+                "The managed flag is currently set at runtime only (nmcli device",
+                "set writes to /run), so it will be gone at the next boot and the",
+                "keyfile will not autoconnect.",
+                "-> ovnctl reconcile --install-nm-profile")
+            return
+
+        if unit_armed:
+            self.ok("Persistent: NetworkManager keyfile + managed flag, with "
+                    "ovn-reconcile.service as a backstop.")
+        else:
+            self.ok("Persistent: NetworkManager keyfile + managed flag in "
+                    "conf.d.")
+            self.detail("`ovnctl reconcile --install-unit` would add a backstop "
+                        "for what NetworkManager cannot fix (system-id, gateway "
+                        "pins, a broken OVS port).")
 
     # ------------------------------------------------------------------
     # 8

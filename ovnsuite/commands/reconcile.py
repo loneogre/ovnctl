@@ -58,9 +58,19 @@ Documentation=man:ovn-controller(8)
 # ovn-controller must be up first: reconcile compares the registered
 # chassis against the configured identity, and there is nothing to
 # compare against until the controller has connected to the SB db.
-After=ovn-controller.service openvswitch.service
-Wants=ovn-controller.service
-Requires=openvswitch.service
+#
+# All three are Wants, not Requires. The unit name for Open vSwitch
+# differs between distributions (openvswitch.service, ovs-vswitchd.service,
+# openvswitch-switch.service); a Requires= on one that does not exist here
+# fails the job outright, and the single thing that repairs a boot would
+# then never run -- silently, because a cancelled job is not a failed one
+# and nothing shows up in `systemctl status ovn-reconcile`.
+#
+# NetworkManager is ordered before us so that its keyfile for host-if has
+# already been applied; reconcile then only has to fix what NM did not.
+After=ovn-controller.service openvswitch.service ovs-vswitchd.service
+After=NetworkManager.service
+Wants=ovn-controller.service openvswitch.service
 
 [Service]
 Type=oneshot
@@ -75,6 +85,26 @@ WantedBy=multi-user.target
 """
 
 NM_PROFILE_DIR = Path("/etc/NetworkManager/system-connections")
+NM_CONF_D = Path("/etc/NetworkManager/conf.d")
+NM_MANAGED_CONF = NM_CONF_D / "99-ovnctl-host-if.conf"
+
+# `nmcli device set <dev> managed yes` writes to /run/NetworkManager, so
+# it lasts exactly until the next reboot -- which is the one moment it
+# needs to hold. NetworkManager treats an OVS internal port as unmanaged
+# by default, so without this file the device comes back at every boot
+# unmanaged, the keyfile below never autoconnects, and host-if sits there
+# with no address and no routes until someone runs reconcile by hand.
+#
+# A [device-*] section is the persistent form of that same flag, and it
+# takes precedence over [keyfile].unmanaged-devices.
+NM_MANAGED_TEMPLATE = """\
+# Written by ovnctl. NetworkManager leaves OVS internal ports unmanaged
+# by default; this makes {iface} an exception so that the
+# {iface}.nmconnection keyfile can autoconnect at boot.
+[device-ovnctl-{iface}]
+match-device=interface-name:{iface}
+managed=1
+"""
 
 
 def register(subparsers) -> argparse.ArgumentParser:
@@ -507,6 +537,10 @@ def _install_nm_profile(ctx: Ctx) -> int:
         print(content, end="")
         print("EOF")
         print(f"chmod 600 {path}")
+        print(f"cat > {NM_MANAGED_CONF} <<'EOF'")
+        print(NM_MANAGED_TEMPLATE.format(iface=setup.host_if), end="")
+        print("EOF")
+        print("systemctl reload NetworkManager")
         print("nmcli connection reload")
         print(f"nmcli device set {setup.host_if} managed yes")
         print(f"nmcli connection up {setup.host_if}")
@@ -518,6 +552,10 @@ def _install_nm_profile(ctx: Ctx) -> int:
         # NetworkManager silently ignores a keyfile that is readable by
         # anyone but root.
         os.chmod(path, 0o600)
+        NM_CONF_D.mkdir(parents=True, exist_ok=True)
+        NM_MANAGED_CONF.write_text(
+            NM_MANAGED_TEMPLATE.format(iface=setup.host_if), encoding="utf-8")
+        os.chmod(NM_MANAGED_CONF, 0o644)
     except OSError as exc:
         ctx.err(f"Could not write {path}: {exc}")
         return 1
@@ -527,6 +565,12 @@ def _install_nm_profile(ctx: Ctx) -> int:
     for net in setup.host_routes:
         if net.strip():
             ctx.say(f"  route    {net} via {setup.host_gw}")
+    ctx.say(f"Wrote {NM_MANAGED_CONF} (keeps {setup.host_if} managed across "
+            "reboots)")
+
+    # The conf.d snippet is read at startup and on reload, not on the
+    # `nmcli connection reload` below -- that one only rescans keyfiles.
+    ctx.run("systemctl", "reload", "NetworkManager")
 
     if not ctx.run("nmcli", "connection", "reload"):
         ctx.warn("nmcli connection reload failed; the profile is on disk but "
@@ -553,6 +597,17 @@ def _install_nm_profile(ctx: Ctx) -> int:
     if ctx.run("nmcli", "connection", "up", setup.host_if):
         ctx.say(f"Activated {setup.host_if}; it will come up with this address "
                 "and these routes at every boot.")
+        state = ctx.qout("nmcli", "-g", "GENERAL.STATE", "device", "show",
+                         setup.host_if).strip()
+        if "unmanaged" in state.lower():
+            ctx.warn(f"NetworkManager still reports {setup.host_if} as "
+                     f"unmanaged despite {NM_MANAGED_CONF}.")
+            ctx.warn("Check for an unmanaged-devices rule that outranks it: "
+                     "grep -rn unmanaged /etc/NetworkManager /usr/lib/"
+                     "NetworkManager")
+            ctx.warn("Until that is resolved the profile will not autoconnect "
+                     "at boot; install the systemd unit as well: "
+                     "ovnctl reconcile --install-unit")
         # Rewriting the keyfile drops any hand-added key, but routes an
         # earlier version of it already installed in the kernel at another
         # metric are not NM's to remove. reconcile's host-interface step
