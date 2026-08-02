@@ -35,7 +35,8 @@ import re
 from dataclasses import dataclass
 
 from .. import ovn
-from ..context import Abort, Ctx, trace_acl_priorities, trace_verdict
+from ..context import (Abort, Ctx, acl_priority_matched,
+                       trace_acl_priorities, trace_verdict)
 from ..inventory import Inventory
 from ..state import ACLS, Tracker, record
 from ..steps import StepRunner, add_step_args
@@ -657,7 +658,7 @@ class ACLManager:
 
     def _trace_expr(self, direction: str, local, peer_ip: str, proto: str,
                     by_ip: dict, lrp_mac: dict):
-        """(datapath, expr) for one probe.
+        """(datapath, expr), or (None, reason) if the endpoint is unusable.
 
         Both passes come through here. If they built expressions
         separately, a rule could be traced one way when it comes from the
@@ -675,6 +676,21 @@ class ACLManager:
         switch = f(local, "switch")
         peer = by_ip.get(peer_ip)
         gw_mac = lrp_mac.get(switch, "")
+
+        # An empty field here produces `eth.src== && ...`, which ovn-trace
+        # rejects with "Syntax error at `&&\' expecting constant" -- a
+        # message that says nothing about the actual problem, which is a
+        # port with no addresses or a switch with no router port. Say
+        # which one is missing instead of emitting a broken flow.
+        missing = [name for name, val in (("switch", switch),
+                                          ("MAC", f(local, "mac")),
+                                          ("address", f(local, "ip")))
+                   if not val]
+        if not missing and not gw_mac and (
+                peer is None or f(peer, "switch") != switch):
+            missing.append(f"router-port MAC for {switch}")
+        if missing:
+            return None, f"port has no {', '.join(missing)}"
 
         if direction == "to-lport":
             datapath = switch
@@ -956,10 +972,14 @@ class ACLManager:
             for plabel, peer_ip, pexpr, local in probes:
                 dp, expr = self._trace_expr(direction, local, peer_ip, pexpr,
                                             by_ip, lrp_mac)
+                if dp is None:
+                    results.append((plabel, peer_ip, expect, "SKIP",
+                                    [], [], expr))
+                    continue
                 out = ovn.trace(ctx, dp, expr)
-                results.append((plabel, peer_ip, local, expect,
-                                trace_verdict(out),
-                                trace_acl_priorities(out, side), out))
+                results.append((plabel, peer_ip, expect, trace_verdict(out),
+                                trace_acl_priorities(out, side),
+                                trace_acl_priorities(out), out))
             self._report_case(label, want_prio, results)
         print("")
 
@@ -988,10 +1008,14 @@ class ACLManager:
             for plabel, peer_ip, pexpr, local in probes:
                 datapath, expr = self._trace_expr(
                     rule.direction, local, peer_ip, pexpr, by_ip, lrp_mac)
+                if datapath is None:
+                    results.append((plabel, peer_ip, expect, "SKIP",
+                                    [], [], expr))
+                    continue
                 out = ovn.trace(self.ctx, datapath, expr)
-                results.append((plabel, peer_ip, local, expect,
-                                trace_verdict(out),
-                                trace_acl_priorities(out, side), out))
+                results.append((plabel, peer_ip, expect, trace_verdict(out),
+                                trace_acl_priorities(out, side),
+                                trace_acl_priorities(out), out))
             label = (f"{rule.name} ({rule.direction} {rule.priority} "
                      f"{rule.action})")
             self._report_case(label, want_prio, results)
@@ -1001,25 +1025,43 @@ class ACLManager:
                      results: list) -> None:
         """One line per rule when it is healthy, detail when it is not.
 
-        Collapsing the ports is deliberate. A rule with a seven-port set
+        Collapsing the probes is deliberate. A rule with a seven-port set
         produces seven traces, and printing seven OK lines for each of
-        eighteen rules buries the two that matter.
+        fifty-eight rules buries the two that matter.
+
+        The classification asks two questions, not one. "Did the packet
+        end up the way the rule says" is not enough on its own: with no
+        default-deny an allow rule and a missing allow rule give the same
+        verdict, and a drop rule gets the credit for a packet some other
+        rule dropped first. So it also asks whether THIS rule is the one
+        that decided, which needs the northd priority offset applied --
+        see acl_priority_matched.
         """
+        ok = []
         bad = []
         shadowed = []
         unmeasured = []
-        for plabel, peer_ip, local, expect, verdict, prios, out in results:
-            decided = [p for p in prios if p > 0]
-            if verdict == "UNKNOWN":
+        skipped = []
+        for plabel, peer_ip, expect, verdict, mine, every, out in results:
+            decided_here = [p for p in mine if p > 0]
+            decided_any = [p for p in every if p > 0]
+            if verdict == "SKIP":
+                skipped.append((plabel, peer_ip, out))
+            elif verdict == "UNKNOWN":
                 unmeasured.append((plabel, peer_ip, out))
-            elif want_prio >= 0 and decided and want_prio not in decided:
-                shadowed.append((plabel, peer_ip, decided[-1], verdict))
-            elif want_prio >= 0 and not decided and expect == "ALLOW":
-                # Allowed, but no ACL claimed it -- the packet fell through
-                # to OVN's default. The rule is a no-op as written.
+            elif want_prio >= 0 and acl_priority_matched(decided_here,
+                                                         want_prio):
+                # Our rule matched. Now the verdict has to agree with it.
+                (ok if verdict == expect else bad).append(
+                    (plabel, peer_ip, verdict, expect, out))
+            elif decided_any:
+                shadowed.append((plabel, peer_ip, max(decided_any), verdict))
+            elif want_prio >= 0:
+                # Nothing in the ACL stage claimed the packet at all.
                 shadowed.append((plabel, peer_ip, 0, verdict))
-            elif verdict != expect:
-                bad.append((plabel, peer_ip, verdict, expect, out))
+            else:
+                (ok if verdict == expect else bad).append(
+                    (plabel, peer_ip, verdict, expect, out))
 
         n = len(results)
         if bad:
@@ -1030,6 +1072,9 @@ class ACLManager:
                       f"expected {expect}")
                 for line in out.splitlines()[-4:]:
                     print(f"           {line}")
+        elif skipped and len(skipped) == n:
+            self.v_skip += 1
+            print(f"  [SKIP] {label:<46} {skipped[0][2]}")
         elif unmeasured and len(unmeasured) == n:
             self.v_warn += 1
             print(f"  [WARN] {label:<46} no verdict (trace failed/timed out)")
@@ -1039,34 +1084,16 @@ class ACLManager:
             self.v_shadow += 1
             first = shadowed[0]
             where = (f"priority {first[2]}" if first[2]
-                     else "no ACL matched -- default allow")
+                     else "no ACL matched")
             print(f"  [DEAD] {label:<46} {len(shadowed)}/{n} decided by "
                   f"{where}")
             for plabel, peer_ip, prio, verdict in shadowed[:3]:
                 print(f"         {peer_ip} {plabel}: {verdict} from "
-                      + (f"priority {prio}" if prio else "the default flow"))
+                      + (f"priority {prio}" if prio else "no ACL"))
         else:
             self.v_ok += 1
-            print(f"  [ OK ] {label:<46} {n} probe(s)")
-
-    # ------------------------------------------------------------------
-    # verify
-    # ------------------------------------------------------------------
-    def _check(self, label: str, expect: str, datapath: str, expr: str) -> None:
-        out = ovn.trace(self.ctx, datapath, expr)
-        verdict = trace_verdict(out)
-        if verdict == expect:
-            print(f"  [ OK ] {label:<46} {verdict}")
-        elif verdict == "UNKNOWN":
-            # Not a failure of the policy -- a failure to measure it.
-            # Printing FAIL here would send you to fix a rule that is fine.
-            print(f"  [WARN] {label:<46} no verdict (trace failed/timed out)")
-            for line in (out.splitlines()[-6:] or ["(no output)"]):
-                print(f"         {line}")
-        else:
-            print(f"  [FAIL] {label:<46} {verdict} (expected {expect})")
-            for line in out.splitlines()[-6:]:
-                print(f"         {line}")
+            extra = f", {len(skipped)} unprobeable" if skipped else ""
+            print(f"  [ OK ] {label:<46} {len(ok)}/{n} probe(s){extra}")
 
     def do_verify(self) -> int:
         ctx = self.ctx

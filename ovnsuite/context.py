@@ -368,6 +368,28 @@ _DROP_MARKERS = (
 )
 
 
+# ovn-northd does not compile an ACL into a logical flow at the ACL's own
+# priority: it adds an offset, so that its own built-in conntrack flows
+# (ct.est, ct.new, the default) can sit below every user rule without
+# anyone having to leave room for them. An ACL at priority 1000 therefore
+# appears in a trace as `priority 2000`, and comparing the two numbers
+# directly reports every correctly-working rule in the deployment as
+# shadowed. The constant is OVN_ACL_PRI_OFFSET in northd.
+ACL_PRI_OFFSET = 1000
+
+
+def acl_priority_matched(decided: list[int], priority: int) -> bool:
+    """Did an ACL of this priority decide the packet?
+
+    Accepts the raw priority as well as the offset one. The offset has
+    been 1000 for many OVN releases, but a trace that reported the
+    unadjusted number would otherwise read as a shadowed rule, and being
+    lenient here costs nothing: the priorities in play are hundreds apart.
+    """
+    return any(p == priority or p == priority + ACL_PRI_OFFSET
+               for p in decided)
+
+
 def trace_verdict(output: str) -> str:
     """ALLOW / DROP / UNKNOWN from an ovn-trace.
 
