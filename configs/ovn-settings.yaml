@@ -1,0 +1,853 @@
+# ============================================================================
+# ovn-settings.yaml -- central configuration for the OVN script suite
+# ============================================================================
+#
+# FORMAT RULES (this is a strict subset of YAML -- the bash loader in
+# ovn-config.sh only understands exactly this shape):
+#   * Two levels only: top-level section, then "  key: value" (2-space indent)
+#   * Lists:  "  key:" on its own line, then '    - "item"' entries (4-space)
+#   * Quote list items; scalar values may be quoted or bare
+#   * Comments start with # (full-line, or after an UNQUOTED value)
+#   * No anchors, no nesting deeper than shown, no multi-line values
+#
+# PRECEDENCE: environment variable > this file > built-in script default.
+# If this file is missing entirely, every script falls back to its
+# built-in defaults and logs a note -- nothing breaks.
+#
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# [topology] -- SHARED names used by MULTIPLE scripts:
+#   ovnsetup.sh, ovnvmsetup.sh, ovnvmisolation.sh, ovndiagnose.sh
+# Change these only with a full teardown/redeploy -- they're identity, not
+# tuning.
+# ----------------------------------------------------------------------------
+topology:
+  br_int: br-int
+  ls_int: ls-int-vm
+  ls_ext: ls-ext-vm
+  ls_host: ls-host
+  lr_core: lr-core
+  host_if: host-if
+
+# ----------------------------------------------------------------------------
+# [setup] -- ovnsetup.sh (base topology, external-ids, host interface)
+# ----------------------------------------------------------------------------
+setup:
+  ovn_remote: unix:/var/run/ovn/ovnsb_db.sock
+  ovn_encap_type: geneve
+  ovn_encap_ip: 127.0.0.1
+  # system_id: REQUIRED, and it must be a fixed string that will never
+  # change for the life of this host. It is the chassis identity: the
+  # Chassis row in the SB db, every Port_Binding.chassis reference and
+  # every gateway pin are keyed off it. Change it and all of those keep
+  # existing while matching nothing.
+  #
+  # There is no fallback. Falling back to $(hostname) is what produced
+  # the "localhost vs localhost.localdomain across a reboot" outage.
+  # `ovnctl setup` and `ovnctl reconcile` also write this value to
+  # /etc/openvswitch/system-id.conf, because ovs-ctl reads that file at
+  # every boot and overwrites external-ids:system-id from it -- setting
+  # only external-ids fixes the running system and nothing else.
+  system_id: ovn-host
+
+  lrp_int: lrp-int-vm
+  lrp_int_mac: 00:00:00:00:01:01
+  lrp_int_cidr: 172.31.1.17/28
+  lrp_ext: lrp-ext-vm
+  lrp_ext_mac: 00:00:00:00:01:02
+  lrp_ext_cidr: 172.31.1.33/28
+
+  # Host management segment. host-if sits on its own /30 rather than
+  # inside the VM subnet, so the workstation LAN can be routed to it
+  # without putting laptops on a VM segment.
+  #   172.31.1.8/30  ->  .9 host-if, .10 router (gateway), .11 broadcast
+  lrp_host: lrp-host
+  lrp_host_mac: 00:00:00:00:01:03
+  lrp_host_cidr: 172.31.1.10/30
+
+  host_if_mac: 40:00:00:00:01:99
+  host_if_ip: 172.31.1.9
+  host_if_prefix: 30
+
+  # Kernel routes added on the host, all via the lrp_host gateway above.
+  # host-if is no longer on the VM segment, so these are required for the
+  # host to reach the VMs at all.
+  host_routes:
+    - "172.31.1.16/28"
+    - "172.31.1.32/28"
+    - "172.31.0.0/27"
+
+<<<<<<< HEAD
+<<<<<<< HEAD
+=======
+  # Metric for the routes above, on BOTH paths that install them: the
+  # NetworkManager profile written by `--install-nm-profile` and the
+  # `ip route replace` that setup and reconcile run.
+  #
+  # This is not cosmetic. `ip route replace` matches on (destination,
+  # metric), so the two paths only agree that they are talking about the
+  # same route if they use the same number. Left unset, NetworkManager
+  # picks 550 for an OVS internal port -- its fallback for a device type
+  # it does not recognise as ethernet -- while the kernel gives an
+  # unqualified `ip route` metric 0, and every prefix ends up installed
+  # twice, once by each owner, with reconcile unable to see or replace
+  # NM's copy.
+  #
+  # Set it whenever the NetworkManager profile is in use. Any value works
+  # as long as it is the same on both sides; 100 matches the usual metric
+  # of a NM-managed ethernet uplink.
+  host_route_metric: 100
+
+>>>>>>> f74f8b2 (commits)
+=======
+  # Metric for the routes in the NetworkManager profile written by
+  # `ovnctl reconcile --install-nm-profile`. Unset means "let
+  # NetworkManager choose", which for an OVS internal port is 550 --
+  # NM's fallback for a device type it does not recognise as ethernet.
+  #
+  # Nothing above depends on this. Each of these prefixes has exactly one
+  # route, and a metric only breaks ties between routes to the SAME
+  # prefix, so 550 is cosmetic. Set it when you want the numbers to be
+  # deterministic rather than a side effect of NM's device typing.
+  # host_route_metric: 100
+
+>>>>>>> 0b99729 (reconcile: optional route metric for the host-if NM profile)
+  # Legacy single-route fields, still honoured if host_routes is absent.
+  remote_subnet: 172.31.1.32/28
+  remote_gw: 172.31.1.10
+
+# ----------------------------------------------------------------------------
+# [localnet_internal] -- ovn-localnet-internal.sh
+#
+# THE uplink -- singular. One physical NIC, one OVS bridge, one localnet
+# port. Everything that leaves lr-core leaves this way, and the next hop
+# is the ASA at lan_gateway. No NAT on the OVN side: traffic keeps its
+# real 172.31.x.x addresses and the ASA does any translation.
+#
+# The bridge key is br_internal, not br_ex. It is named for the side OVN
+# sits on, not for where the traffic ends up -- everything on the far
+# side of the ASA is reached through this same wire.
+#
+# NOTE ON THE SECOND NIC: this deployment used to run a separate
+# ASA-facing NIC (enp3s0 -> br-asa -> asanet). That is gone.
+# [localnet_external] is now policy only -- it decides what MUST be
+# handed to the ASA, and the ASA does the separation the second NIC
+# used to do physically.
+# ----------------------------------------------------------------------------
+localnet_internal:
+  phys_nic: enp2s0
+  br_internal: br-internal
+  physnet_label: physnet
+  ls_uplink: ls-uplink
+  ln_uplink: ln-uplink
+  lrp_uplink: lrp-uplink
+  lrp_uplink_mac: 40:00:00:00:02:01
+
+  # The point-to-point link between OVN and the ASA. OVN owns transit_ip
+  # on it, the ASA owns lan_gateway, and lr-core's 0.0.0.0/0 points at
+  # lan_gateway. Everything beyond -- the workstation LAN and whatever
+  # else the ASA fronts -- is the ASA's routing problem, not OVN's.
+  transit_subnet: 172.31.1.4/30
+  lan_gateway: 172.31.1.5
+  transit_ip: 172.31.1.6/30
+  workstation_subnet: 172.31.0.0/27
+  gateway_chassis_priority: 10
+
+# ----------------------------------------------------------------------------
+# [localnet_external] -- ovn-localnet-external.sh. POLICY ONLY.
+#
+# With a single NIC there is nothing physical left for this script to
+# build: no bridge, no NIC, no logical switch, no router port. All of
+# that is [localnet_internal]'s job now. What survives is the logical
+# router POLICY -- the rules that force traffic to the ASA even when the
+# ordinary route table would have kept it inside OVN.
+#
+# READ THIS ONCE: the split is no longer physical. Everything reaches
+# the ASA over the same wire, so the ASA is what separates "our internal
+# traffic" from "engagement traffic". These policies only decide what
+# OVN hands over; they cannot decide what happens after that.
+#
+# split_subnet  the source subnet these policies apply to (the ext-vms).
+# next_hop      leave EMPTY to use [localnet_internal].lan_gateway, which
+#               is the ASA. Set it only if the ASA is a different device
+#               sharing the same transit link. Either way it must sit
+#               inside [localnet_internal].transit_subnet -- a reroute to
+#               an off-link next hop cannot be resolved, and the script
+#               refuses rather than installing a black hole.
+# ----------------------------------------------------------------------------
+localnet_external:
+  split_subnet: 172.31.1.32/28
+  next_hop: ""
+
+# ----------------------------------------------------------------------------
+# [internal_ranges] -- SHARED by ovnlocalnetexternal.sh AND
+# ovnvmisolation.sh. "What counts as OUR internal networks" -- used to
+# build both the ASA-bypass exclusions and the isolation drop ACLs.
+# NOT all of RFC1918 (the external-to-us network behind the ASA also uses
+# RFC1918, so a blanket block would sever the isolated VMs' only path).
+# Takes precedence over ovn-internal-ranges.conf if both exist.
+# ----------------------------------------------------------------------------
+internal_ranges:
+  ranges:
+    # The user-VM segment. Listed so the isolated VMs and the internal VMs
+    # cannot reach it either -- isolation there is written as "block the
+    # internal ranges", so a segment missing from this list is reachable
+    # from everything that uses it.
+    - "172.31.255.0/28"
+    - "172.31.1.8/30"
+    - "172.31.1.16/28"
+    - "172.31.1.32/28"
+    - "172.31.0.0/27"
+    - "172.31.1.4/30"
+
+# ----------------------------------------------------------------------------
+# [external_ranges] -- SHARED by ovn-localnet-external.sh AND
+# ovn-vm-isolation.sh. Destinations that live BEHIND THE ASA (the
+# "external-to-us" network). Declaring these POSITIVELY -- rather than
+# relying only on "not internal" -- is what makes overlap survivable:
+# a positive match at a higher priority beats the internal fall-through
+# deterministically, instead of being silently swallowed by an exclusion
+# list.
+#
+# Leave the list empty to keep the old exclusion-only behaviour.
+# Every script cross-checks these against [internal_ranges] with
+# ovn-netcalc.sh and reports any intersection LOUDLY rather than
+# guessing.
+# ----------------------------------------------------------------------------
+external_ranges:
+  ranges: []
+  # Example -- uncomment and edit for your environment:
+  #  - "192.168.50.0/24"
+  #  - "10.200.0.0/16"
+
+# ----------------------------------------------------------------------------
+# [engagement] -- ovn-localnet-external.sh. THE PER-JOB SECTION.
+#
+# When a client gives you an address/subnet to work in, this is the only
+# section that changes. Everything else stays put.
+#
+# READ THIS FIRST -- most of the time you do not need to add anything:
+#   lr-core's default route already sends EVERYTHING that is not one of
+#   our own connected subnets to the ASA. So a client subnet like
+#   10.50.0.0/16 or 192.168.20.0/24 is handled the moment you are told
+#   about it, with zero configuration. The ext-vms keep 172.31.1.33 as
+#   their default gateway permanently and never need a route change --
+#   they hand the packet to OVN and OVN decides.
+#
+# You only need to list a subnet here when it COLLIDES with one of our
+# own [internal_ranges] -- e.g. the client hands you 172.31.0.0/16, which
+# swallows our whole estate. In that case the "not internal" test says
+# "internal" and the traffic would stay inside. Listing it here creates a
+# POSITIVE match at priority 250, above the exclusion rule, so it goes to
+# the ASA anyway.
+#
+# Scope of that override: it applies ONLY to traffic sourced from
+# [localnet_external].split_subnet (the ext-vm subnet). Machines on
+# ls-int-vm are completely unaffected and keep reaching those addresses
+# internally as normal. For the ext-vms, the colliding addresses become
+# the CLIENT's hosts rather than ours -- which is the intent, since those
+# are the engagement machines.
+#
+# Manage this list without hand-editing:
+#   ./ovn-localnet-external.sh --add-target 10.50.0.0/16
+#   ./ovn-localnet-external.sh --del-target 10.50.0.0/16
+#   ./ovn-localnet-external.sh --list-targets
+#   ./ovn-localnet-external.sh --clear-targets      (end of engagement)
+# Each of those rewrites this file and re-applies the policy immediately.
+#
+# snat_address is DOCUMENTATION ONLY -- the address the client issued us,
+# which the ASA SNATs our traffic to (and DNATs inbound from). Nothing
+# reads it; it is recorded here so the engagement's context lives with
+# the config.
+# ----------------------------------------------------------------------------
+engagement:
+  target_subnets: []
+  #  - "10.50.0.0/16"
+  snat_address: ""
+  priority_target: 250
+
+# ----------------------------------------------------------------------------
+# [shadow_ranges] -- ovn-localnet-external.sh. THE OVERLAP ANSWER.
+#
+# When an external destination genuinely overlaps one of our internal
+# ranges, no destination-based rule can reach both -- one prefix cannot
+# have two next-hops. The fix is to give the external side a synthetic
+# address that CANNOT collide: 100.64.0.0/10 (RFC6598 carrier-grade NAT
+# space, deliberately not RFC1918).
+#
+# How it works:
+#   * VMs address the external service at its shadow IP (e.g. 100.64.10.5)
+#   * OVN reroutes anything in shadow space to the ASA, positively, at
+#     high priority -- no exclusion arithmetic involved
+#   * The ASA static-DNATs shadow -> real overlapping address, and SNATs
+#     the return path
+#   * The SAME real address stays reachable internally, untouched, because
+#     OVN never sees it as external
+# So both realms are usable simultaneously, with NO re-IP of internal
+# infrastructure. Re-engineering on the fly = add/change an ASA mapping;
+# OVN config does not change.
+#
+# Caveats worth knowing: the guests must learn the shadow addresses
+# (split-horizon DNS or hosts entries), and protocols that embed IPs in
+# their payload (FTP, SIP, some Kerberos/AD flows) need ASA inspection or
+# will break. Verify this against FreeIPA traffic before relying on it.
+#
+# 'mappings' is DOCUMENTATION ONLY -- nothing reads it; the actual
+# translation lives on the ASA. It's here so the intent is recorded in
+# the same place as everything else.
+# ----------------------------------------------------------------------------
+shadow_ranges:
+  ranges: []
+  # Recommended when overlap exists -- uncomment:
+  #  - "100.64.0.0/10"
+  mappings: []
+  #  - "100.64.10.0/24 => 192.168.50.0/24 (overlapping ASA-side subnet)"
+
+# ----------------------------------------------------------------------------
+# [policy] -- ovn-localnet-external.sh. Logical router policy priorities.
+# HIGHER priority is evaluated FIRST:
+#
+#   300 source_override : listed VMs go to the ASA regardless of
+#                         destination (destination overlap becomes
+#                         irrelevant -- it isn't part of the match)
+#   250 engagement      : per-job client subnets (see [engagement])
+#   200 shadow          : anything addressed into shadow space -> ASA
+#   150 external        : positively-declared external ranges -> ASA
+#   100 split           : "src subnet AND not internal"
+#
+# WHAT A TIER IS WORTH NOW THAT THERE IS ONE NEXT HOP:
+# The default route already sends everything non-connected to the ASA,
+# so a tier only earns its keep when it BEATS a more specific route that
+# would otherwise have kept the packet inside OVN. That means:
+#
+#   300 source_override  MEANINGFUL -- it overrides the connected routes
+#                        for our own subnets, so a listed VM cannot reach
+#                        anything internally even by direct delivery.
+#   250 engagement       MEANINGFUL -- exactly the overlap case: a client
+#   150 external         subnet that also matches one of our connected or
+#                        internal prefixes.
+#   200 shadow           REDUNDANT unless shadow space overlaps something
+#                        of ours (100.64/10 does not) -- kept because it
+#                        costs nothing and documents the intent.
+#   100 split            REDUNDANT with the default route -- same source,
+#                        same non-internal destinations, same next hop.
+#                        Kept so the intent survives a route change, and
+#                        the script says so at -v rather than pretending
+#                        it is doing something.
+#
+# external_only_ips: VMs that must NEVER reach anything of ours directly.
+# The isolated four are the natural members -- ovn-vm-isolation.sh
+# already forbids them, and tier 300 makes it true at the routing layer
+# too, not just at the ACL layer.
+# ----------------------------------------------------------------------------
+policy:
+  priority_source_override: 300
+  priority_shadow: 200
+  priority_external: 150
+  # The split is TWO policies, not one:
+  #   priority_split_allow  dst IS internal      -> allow (route normally)
+  #   priority_split        everything from src  -> reroute to the ASA
+  #
+  # It used to be a single rule with a negated destination ("reroute
+  # everything except our ranges"). Negation is where OVN's expression
+  # engine does its expensive work -- it computes the complement of each
+  # prefix -- and on this deployment four such logical flows cost 3 GB of
+  # ovn-controller memory, growing to 14 GB as logical ports were added,
+  # while producing no extra OpenFlow rules. Expressed positively it costs
+  # nothing. Keep priority_split_allow above priority_split.
+  priority_split_allow: 110
+  priority_split: 100
+  external_only_ips:
+    # DO NOT add ext-vm1 (172.31.1.34) here, even though it is now in
+    # [vm_isolation].isolated_vms. Tier 300 ignores the destination and
+    # reroutes EVERYTHING from a listed source to the ASA -- including the
+    # replies to an SSH session from the workstation LAN, which would
+    # never come back. Its isolation is enforced at the ACL layer only,
+    # which is what leaves room for the exception.
+    - "172.31.1.36"
+    - "172.31.1.37"
+    - "172.31.1.38"
+    - "172.31.1.39"
+  # Refuse to apply policy at all when internal/external ranges intersect
+  # and no shadow range is configured to resolve it. false = warn loudly
+  # but continue (useful while you're still working out the mapping).
+  fail_on_unresolved_overlap: true
+
+# ----------------------------------------------------------------------------
+# [vm_config] -- ovnvmsetup.sh. Format per entry: "name uuid mac ip".
+# UUIDs/MACs are pinned to the libvirt domain XMLs -- keep in sync, and
+# don't regenerate one side without the other.
+# Internal subnet 172.31.1.16/28 (gw .17); external 172.31.1.32/28 (gw .33).
+# ----------------------------------------------------------------------------
+vm_config:
+  internal_vms:
+    - "int-vm1 d26211bf-2a85-4796-abfa-12c90c40b464 52:54:00:df:c2:34 172.31.1.18"
+    - "int-vm2 3bd91f0c-7254-47fd-afd4-446d2d5c3bb6 52:54:00:3c:9c:b8 172.31.1.19"
+    - "int-vm3 422202ee-1f8b-44e3-a2f7-6a26c1dee498 52:54:00:3d:ab:e6 172.31.1.20"
+    - "int-vm4 fc0da778-2ce7-466b-9864-a2bb6918967d 52:54:00:b7:7c:d4 172.31.1.30"
+  external_vms:
+    - "ext-vm1 b4d8b36b-4bd3-4ec9-80e9-0434c18b46fa 52:54:00:28:9a:11 172.31.1.34"
+    - "ext-vm2 83e41082-b11a-428d-b21b-12fadca1b487 52:54:00:b9:ce:e2 172.31.1.35"
+    - "ext-vm3 19b357ac-05ba-4124-8536-9c24053803ee 52:54:00:15:e1:82 172.31.1.36"
+    - "ext-vm4 91b7bdad-56b3-4a1b-9e48-e6485cc4215c 52:54:00:4b:1f:99 172.31.1.37"
+    - "ext-vm5 6969ab22-1828-40c1-8fed-aa2f5a530e0c 52:54:00:6b:e2:28 172.31.1.38"
+    - "ext-vm6 70d670c5-b53a-455a-bc52-b604d5ec8cf1 52:54:00:b7:7b:47 172.31.1.39"
+
+# ----------------------------------------------------------------------------
+# [vm_isolation] -- ovnvmisolation.sh. Format per entry: "name uuid ip".
+# Must be a subset of vm_config entries above.
+# ----------------------------------------------------------------------------
+vm_isolation:
+  # IMPORTANT: no hyphens. Port-group ACL matches must scope themselves
+  # with "inport == @<name>" / "outport == @<name>", and OVN's match
+  # lexer only accepts letters, digits, underscore and dot in an
+  # identifier -- "@pg-isolated" will not parse. Without that scoping the
+  # ACL applies to EVERY port on the switch, not just group members.
+  pg_name: pg_isolated
+  acl_priority: 1000
+  # Port groups from older runs to delete on apply. Leaving a legacy
+  # hyphenated group behind would keep its unscoped (switch-wide) ACLs
+  # active alongside the new correctly-scoped ones.
+  legacy_pg_names:
+    - "pg-isolated"
+  isolated_vms:
+    # ext-vm1 is isolated like the rest, but is reachable by SSH from the
+    # workstation LAN. That exception is a rule in [acls] (pg_ext_mgmt),
+    # NOT a change here -- membership of this group is what denies it
+    # everything else, and the exception has to sit at a higher priority
+    # than this group's drops rather than carving a hole in them.
+    - "ext-vm1 b4d8b36b-4bd3-4ec9-80e9-0434c18b46fa 172.31.1.34"
+    - "ext-vm3 19b357ac-05ba-4124-8536-9c24053803ee 172.31.1.36"
+    - "ext-vm4 91b7bdad-56b3-4a1b-9e48-e6485cc4215c 172.31.1.37"
+    - "ext-vm5 6969ab22-1828-40c1-8fed-aa2f5a530e0c 172.31.1.38"
+    - "ext-vm6 70d670c5-b53a-455a-bc52-b604d5ec8cf1 172.31.1.39"
+
+# ----------------------------------------------------------------------------
+# [acls] -- ovn-acl.sh. Declarative micro-segmentation.
+#
+# port_groups: "<name> <selector>"
+#   name      must be a valid OVN identifier (letters/digits/underscore,
+#             NO hyphens -- it is referenced as @name inside a match)
+#   selector  all | internal | external | isolated | all-except-isolated
+#   Membership is built from [vm_config] every run, so it cannot drift.
+#
+# rules: "<name> <direction> <priority> <action> <group> <spec>..."
+#   direction  to-lport   evaluated on the way IN to a group member
+#              from-lport evaluated on the way OUT of a group member
+#   action     allow | allow-related | drop | reject
+#   spec       src=CIDR[,CIDR]   dst=CIDR[,CIDR]   src=any
+#              src=internal / dst=internal  expands to [internal_ranges]
+#              tcp=PORT   udp=PORT   icmp
+#   Higher priority wins. Anything with no matching rule is ALLOWED
+#   (OVN's default), so these rules only constrain what they name.
+#
+# The default set below gives: management SSH in from the host segment
+# and the workstation LAN, and no lateral SSH between VMs in either
+# direction or across subnets. Non-SSH traffic is untouched, and SSH out
+# to client/engagement networks still works (only internal destinations
+# are blocked).
+#
+# The isolated four are deliberately NOT members -- they are already
+# fully cut off from internal by ovn-vm-isolation.sh, and adding an
+# allow rule for them would punch a hole in that.
+# ----------------------------------------------------------------------------
+acls:
+  enabled: true
+
+  # Named port sets, referenced from a rule as tcp=@name / udp=@name.
+  # FreeIPA client enrolment (ipa-client-install) needs all of these.
+  port_sets:
+    - "freeipa_tcp 80,443,389,636,88,464,749"
+    - "freeipa_udp 88,464,53,123"
+
+  # Selectors: all | internal | external | isolated | all-except-isolated
+  #            names=vm1,vm2   ips=1.2.3.4,5.6.7.8
+  port_groups:
+    - "pg_vms all-except-isolated"
+    - "pg_ipa_client ips=172.31.1.35"
+    - "pg_ipa_server ips=172.31.1.30"
+    # ext-vm1 only. Isolated, but SSH-able from the workstation LAN.
+    - "pg_ext_mgmt names=ext-vm1"
+
+  rules:
+    # --- management SSH in, no lateral SSH -----------------------------
+    - "ssh-mgmt-in     to-lport   2000 allow-related pg_vms src=172.31.1.8/30,172.31.0.0/27 tcp=22"
+    - "ssh-lateral-in  to-lport   1900 drop          pg_vms src=any                         tcp=22 log"
+    - "ssh-lateral-out from-lport 1900 drop          pg_vms dst=internal                    tcp=22 log"
+
+    # --- ext-vm1: isolated, but SSH in from the workstation LAN ---------
+    # Priority 1100 > [vm_isolation].acl_priority (1000), which is what
+    # makes this an exception to the isolation drops rather than a
+    # separate policy. Keep it above that number and below 1900 if you
+    # ever move ext-vm1 back into pg_vms.
+    #
+    # 172.31.0.0/27 ONLY. Note this is deliberately narrower than
+    # ssh-mgmt-in above, which also admits the host segment
+    # (172.31.1.8/30) -- the host must not be able to SSH this VM.
+    #
+    # allow-related is required, not cosmetic: the reply travels OUT of
+    # ext-vm1 towards 172.31.0.0/27, which is in [internal_ranges] and so
+    # is dropped by the isolation from-lport rule. allow-related puts the
+    # flow in conntrack and the reply is matched by OVN's built-in
+    # established/reply rules long before that drop is reached.
+    - "extvm1-ssh-in  to-lport   1100 allow-related pg_ext_mgmt src=172.31.0.0/27 tcp=22 log"
+
+    # --- FreeIPA domain join: ext-vm2 (.35) -> int-vm4 (.30) ------------
+    # Priority 2100 so these survive a future default-deny for lateral
+    # traffic. With the current rule set they are permissive no-ops --
+    # nothing blocks these ports today -- but they record the intent and
+    # will keep the domain join working if the policy is tightened.
+    - "ipa-join-tcp   from-lport 2100 allow-related pg_ipa_client dst=172.31.1.30 tcp=@freeipa_tcp"
+    - "ipa-join-udp   from-lport 2100 allow-related pg_ipa_client dst=172.31.1.30 udp=@freeipa_udp"
+    - "ipa-ping-out   from-lport 2100 allow-related pg_ipa_client dst=172.31.1.30 icmp"
+    # Inbound to the IPA server, from ext-vm2 AND the workstation LAN.
+    # Laptops joining the domain need exactly the same ports as a VM does.
+    - "ipa-serve-tcp  to-lport   2100 allow-related pg_ipa_server src=172.31.1.35,172.31.0.0/27 tcp=@freeipa_tcp"
+    - "ipa-serve-udp  to-lport   2100 allow-related pg_ipa_server src=172.31.1.35,172.31.0.0/27 udp=@freeipa_udp"
+    - "ipa-ping-in    to-lport   2100 allow-related pg_ipa_server src=172.31.1.35,172.31.0.0/27 icmp"
+
+  # Checked by ./ovn-acl.sh --verify.
+  # Format: "<name> <src-ip> <dst-ip> <tcp|udp|icmp> <port|-> <ALLOW|DROP>"
+  verify_pairs:
+    - "ipa-ldap    172.31.1.35 172.31.1.30 tcp  389 ALLOW"
+    - "ipa-ldaps   172.31.1.35 172.31.1.30 tcp  636 ALLOW"
+    - "ipa-krb     172.31.1.35 172.31.1.30 udp  88  ALLOW"
+    - "ipa-https   172.31.1.35 172.31.1.30 tcp  443 ALLOW"
+    - "ipa-dns     172.31.1.35 172.31.1.30 udp  53  ALLOW"
+    - "ipa-ping    172.31.1.35 172.31.1.30 icmp -   ALLOW"
+    - "ipa-no-ssh  172.31.1.35 172.31.1.30 tcp  22  DROP"
+    # Workstation LAN -> IPA server. The source is not a VM, so the trace
+    # enters via the router port rather than an inport on the switch.
+    - "wks-ldap    172.31.0.5  172.31.1.30 tcp  389 ALLOW"
+    - "wks-krb     172.31.0.5  172.31.1.30 udp  88  ALLOW"
+    - "wks-https   172.31.0.5  172.31.1.30 tcp  443 ALLOW"
+    - "wks-dns     172.31.0.5  172.31.1.30 udp  53  ALLOW"
+    - "wks-ping    172.31.0.5  172.31.1.30 icmp -   ALLOW"
+    - "wks-ssh     172.31.0.5  172.31.1.30 tcp  22  ALLOW"
+
+
+# ----------------------------------------------------------------------------
+# [acl_log] -- where ACL log records go, and how fast they may arrive.
+#
+# LOGGING IS PER RULE, and off unless the rule asks for it. Append one of
+# these tokens to a rule in [acls].rules:
+#
+#   log            log every packet the rule matches, at .severity below
+#   log=notice     the same, at a specific severity
+#                  (alert | warning | notice | info | debug)
+#   meter=NAME     rate-limit this rule with a named meter of its own
+#   nolog          explicit off, for a rule you are toggling
+#
+# e.g.  - "ssh-lateral-in to-lport 1900 drop pg_vms src=any tcp=22 log"
+#
+# Log DROP rules freely -- they should rarely fire, and when they do you
+# want the record. Think hard before logging an ALLOW rule on a busy
+# segment: it writes a line per packet, to the same disk the captures go
+# to. The meter below is applied to every logging rule for that reason.
+#
+# HOW THE DIRECTORY IS IMPLEMENTED. OVN has no per-ACL log destination.
+# log=true makes ovn-controller emit the record through its own vlog, and
+# that is all OVN offers -- the records land wherever ovn-controller logs,
+# mixed in with everything else it says. So `ovnctl acl` does two things:
+#   1. ovn-appctl vlog/set acl_log:syslog:<severity>
+#   2. writes /etc/rsyslog.d/10-ovn-acl.conf, filing anything containing
+#      'acl_log' into <directory>/<filename> and stopping it there, so it
+#      does not also fill /var/log/messages
+#
+# Set manage_sink: false to keep the per-rule logging but configure the
+# destination yourself. Records then stay in ovn-controller's log:
+#   journalctl -u ovn-controller | grep acl_log
+#
+# NOTE: the vlog level is RUNTIME state and does not survive an
+# ovn-controller restart. `ovnctl reconcile` re-applies it at boot; if you
+# restart the controller by hand, re-run `ovnctl acl --only log-sink` or
+# the logging stops while the ACLs still claim log=true.
+#
+# HISTORICAL NOTE: logging was removed for a while on suspicion of causing
+# ovn-controller's memory blow-up. It was not the cause -- a negated
+# destination in the tier-100 router policy was -- and it is back. A
+# logged drop does compile differently (northd emits `log(...); /* drop */`
+# instead of `drop;`) but it is not expensive.
+#
+# Rotation is not configured here -- add a logrotate drop-in for the file
+# below if you expect volume.
+# ----------------------------------------------------------------------------
+acl_log:
+  directory: /var/log/ovn-acl
+  filename: acl.log
+  # Default severity for a rule that says bare 'log'.
+  severity: info
+  # Rate limit applied to every logging rule that does not name its own
+  # meter. Packets over the limit are still dropped/allowed as the ACL
+  # says -- only the LOG RECORD is discarded.
+  meter: acl-log-meter
+  rate_pps: 100
+  burst: 50
+  # false = do not touch rsyslog or the vlog level; per-rule log=true is
+  # still applied and records stay in ovn-controller's log.
+  manage_sink: true
+# ----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# [user_vms] -- ovnctl user-vm. Self-service slots for VMs we do not own.
+#
+# Ten pre-sized slots on their own segment behind lr-core. Allocated one
+# at a time; each allocation prints the virsh configuration to paste into
+# the guest's domain XML.
+#
+#   172.31.255.0/28   gateway 172.31.255.1   slots .2 - .11
+#
+# THE POLICY IS FIXED AND DELIBERATELY NARROW. Every slot may reach
+# defended terrain (nothing matches, the default route sends it to the
+# ASA) and nothing else. It may not reach our internal networks, and --
+# the part that is easy to get wrong -- it may not reach the OTHER SLOTS.
+# Slots share a subnet, so that traffic never passes the router and no
+# rule written about "internal networks" would ever see it; the drop set
+# therefore includes this subnet itself.
+#
+# The only per-VM choice is which management protocols may reach it,
+# selected at creation with --ssh / --rdp. That is the only knob that
+# cannot weaken anyone else's isolation.
+#
+# ALLOCATION IS RECORDED IN state/user-vms.json, not here. That file holds
+# each slot's UUID and MAC, which must survive `delete --purge-db` --
+# somebody else's libvirt domain references them by value. `ovnctl user-vm
+# --reapply` rebuilds OVN from it.
+#
+# management_source: who may open those sessions. One subnet, matching the
+# workstation LAN. Widening it widens it for every slot at once.
+# ----------------------------------------------------------------------------
+user_vms:
+  name_prefix: user-vm
+  slots: 10
+  subnet: 172.31.255.0/28
+  gateway: 172.31.255.1
+  first_ip: 172.31.255.2
+  switch: ls-user-vm
+  lrp: lrp-user-vm
+  lrp_mac: 00:00:00:00:01:04
+  pg_name: pg_user_vms
+  management_source: 172.31.0.0/27
+  # Which inbound protocols a slot MAY be given, and on which port. The
+  # protocol is chosen per slot at creation time (--ssh / --rdp / --http /
+  # --https); these keys only change the port each one means, for a
+  # segment whose services do not sit on the well-known numbers.
+  port_ssh: 22
+  port_rdp: 3389
+  port_http: 80
+  port_https: 443
+  # access_priority MUST exceed drop_priority -- the management rules are
+  # exceptions to the isolation drops. The command refuses to run if this
+  # is inverted, because the failure mode is ten silently unreachable VMs.
+  drop_priority: 1000
+  access_priority: 1100
+
+# ----------------------------------------------------------------------------
+# [vm_names] -- optional. Maps an inventory name from [vm_config] to the
+# libvirt domain name, when the two differ.
+#
+# ovn-pcap.sh normally discovers the libvirt domain automatically (it is
+# already reading virsh to find each VM's tap), so this list is only
+# needed for VMs that are powered off at capture time, or when you want a
+# label that is neither the inventory name nor the domain name.
+#
+# Format: "<inventory-name> <libvirt-domain>"  -- an entry here always
+# wins over auto-detection.
+# ----------------------------------------------------------------------------
+vm_names:
+  map: []
+  #  - "ext-vm3 velociraptor-prod"
+  #  - "ext-vm4 nessus-scanner-01"
+
+# ----------------------------------------------------------------------------
+# [pcap] -- ovn-pcap.sh. Packet capture via OVS port mirroring.
+#
+# How it works: each target VM gets a dedicated internal capture port on
+# br-int named <mirror_prefix>-<vm>, and an OVS mirror copies that VM's
+# tap traffic (both directions) into it. tcpdump then writes rotated
+# pcaps from the capture port.
+#
+# Why mirroring instead of capturing on the tap directly: tap names
+# (vnetN) change every time a VM restarts, which kills a tcpdump bound to
+# them. The capture port name never changes, so the capture survives a VM
+# reboot -- re-point the mirror with --restart and the same files keep
+# growing.
+#
+# enabled must be true before --start will do anything, so a capture can
+# never be running without it being recorded in config.
+#
+# WHERE THE CAPTURE PORTS LIVE: <mirror_prefix>-<vm> ports are plain OVS
+# ports on br-int. They appear in `ovs-vsctl show` and `ip link`, and are
+# deliberately NOT visible in ovn-show -- they are created without an
+# iface-id, so OVN never learns about them and will not try to bind them
+# as logical ports. They exist only while a capture is running; --stop
+# removes both the mirror and the port.
+#
+# Resolving each VM's tap requires libvirt (virsh) on this host. Without
+# it there is nothing to mirror and --start refuses rather than creating
+# ports that would capture nothing.
+#
+# targets: the same selector syntax as [acls].port_groups --
+#
+#   all | internal | external | isolated | all-except-isolated
+#   names=ext-vm1,int-vm3        specific VMs from [vm_config]
+#   ips=172.31.1.34              the same, by address
+#
+# 'isolated' tracks [vm_isolation].isolated_vms, so a VM added there is
+# captured from the next --start with no change here. Use names= or ips=
+# when the capture set is deliberately NOT the isolation set -- e.g.
+# capturing one VM during an investigation without isolating it, or
+# isolating a VM you have no reason to record.
+#          names=ext-vm3,ext-vm4   ips=172.31.1.36,172.31.1.37
+#
+# Layout with subdirs enabled:
+#   /var/log/ovn-pcap/ext-vm3/ext-vm3_20260728-034500.pcap.gz
+#   /var/log/ovn-pcap/ext-vm4/ext-vm4_20260728-034500.pcap.gz
+# The VM name is kept in the filename as well as the directory, so files
+# stay self-identifying once copied elsewhere for analysis.
+#
+# Storage is a RING BUFFER per VM: max_files x rotate_seconds. With the
+# defaults that is 24 hours of history per VM, oldest deleted first, so
+# the disk cannot fill without bound. Size it deliberately -- a busy VM
+# at full snaplen can produce gigabytes per hour.
+# ----------------------------------------------------------------------------
+pcap:
+  enabled: false
+  # THE CAPTURE ROOT. Two subdirectories are created under it:
+  #
+  #   <directory>/inflight/[<vm>/]    tcpdump's open, still-growing file
+  #   <directory>/completed/[<vm>/]   closed files, nothing else
+  #
+  # On every rotation the -z hook moves the closed file from inflight/ to
+  # completed/. Both are under this one path and therefore on one
+  # filesystem, so that move is a rename: the file appears under its final
+  # name complete, or it does not appear at all.
+  #
+  # THAT IS THE POINT. Whatever transfers these to the Malcolm VM takes
+  # everything in completed/ and ignores inflight/ entirely -- no
+  # CLOSE_WRITE watch, no lsof check, no rule about skipping the newest
+  # file per VM. There is no such thing as a partial file in completed/.
+  #
+  # Malcolm cannot ingest from a host directory, only from the upload
+  # directory on the VM it runs on, so that transfer is a separate
+  # mechanism. This layout is the contract it depends on.
+  #
+  # Do not bind-mount or otherwise separate the two subdirectories. If they
+  # end up on different filesystems the move becomes copy-then-unlink and
+  # the guarantee is gone; --start checks and warns.
+  directory: /malcolm/pcap
+  # Names of the two subdirectories, if the transfer expects something
+  # else. Defaults are fine.
+  inflight_dir: inflight
+  completed_dir: completed
+  # Currently: ext-vm1, ext-vm3, ext-vm4, ext-vm5, ext-vm6.
+  targets: isolated
+  snaplen: 0                # 0 = whole packet; 96 for headers only
+  filter: ""                # optional BPF, e.g. "not port 22"
+  rotate_seconds: 3600
+  # max_files is tcpdump's own -W. With -G it caps how many rotated files
+  # tcpdump will create before it stops, per VM. Files leave inflight/ on
+  # every rotation, so in normal operation that directory holds exactly one
+  # file per VM; this is the backstop for when the hook cannot move them.
+  max_files: 24
+  # archive_max_files caps what is kept in completed/, and 0 means
+  # unlimited.
+  #
+  # The default is deliberately 0. These are engagement captures, and a
+  # script quietly deleting evidence to save disk is a worse failure than a
+  # disk you are already monitoring filling up. Note that it deletes from
+  # completed/, so a file it removes may be one the transfer has not
+  # collected yet.
+  #   24 with rotate_seconds 3600 = the last 24 hours per VM
+  archive_max_files: 0
+
+  # WHO GETS THE FINISHED CAPTURES
+  #
+  # By ACL, never by chown. -Z drops tcpdump's privileges BEFORE the output
+  # file is created, so each pcap is born owned by drop_user and its
+  # primary group. The rotate hook inherits those dropped privileges and
+  # has no CAP_CHOWN, so it could not change ownership even if asked --
+  # which is why the old archive_owner ("1000:1000") setting is gone
+  # rather than merely unset.
+  #
+  # archive_reader -- a UID or username granted rwx on the capture
+  #   directories, plus a default entry so every rotated file inherits it.
+  #   This is what the transfer process needs: read to copy, write to
+  #   delete once it has.
+  #   That is read, write and delete on the captures without anyone owning
+  #   them, and it is what a transfer process actually needs.
+  #     archive_reader: 1000
+  archive_reader: ""
+  mirror_prefix: mir
+  # tcpdump opens the interface as root and then DROPS PRIVILEGES to this
+  # user before creating any output file -- a deliberate hardening measure,
+  # since it is parsing untrusted traffic. The consequence is that the
+  # capture directory must be writable by that user, not merely by root,
+  # or every write fails with "Permission denied".
+  #
+  # RHEL/Oracle Linux package it as "tcpdump"; Debian/Ubuntu use "pcap".
+  #
+  # ACCESS IS GRANTED BY POSIX ACL, NOT BY CHOWN. The script runs
+  #   setfacl -m u:<drop_user>:rwx  <dir>
+  #   setfacl -d -m u:<drop_user>:rwX  <dir>
+  # on each capture directory. Ownership and mode are left exactly as the
+  # provisioning left them, and -m only ADDS an entry, so any ACL already
+  # on those directories (the '+' in `ls -l`) survives untouched.
+  #
+  # rwx rather than rw is deliberate: on a directory, 'x' is what allows
+  # entering it, and rw without x cannot be written to at all.
+  #
+  # Requires the acl package and a filesystem mounted with ACL support.
+  # Set to "root" to disable the privilege drop entirely (not advised when
+  # capturing from untrusted VMs).
+  #
+  # OWNERSHIP IS DECIDED HERE and nowhere else. -Z drops privileges before
+  # the capture file is created, so each pcap is born owned by this account
+  # and its primary group; nothing chowns it afterwards. `--start` prints
+  # the effective uid:gid so you can confirm what the files will look like.
+  drop_user: ovnpcap
+  min_free_mb: 2048         # warn below this
+  # true  -> <directory>/<vm>/<file>
+  # false -> everything flat in <directory>
+  subdirs: true
+  # Filenames are:
+  #   <file_prefix>_<virsh-vm-name>_<capture-interface>_<YYYYMMDDHHMMSS>.pcap
+  # e.g. internal_velociraptor-prod_mir-extvm3_20260730143022.pcap
+  #
+  # The timestamp is 14 bare digits with no separators, so names sort
+  # lexically into time order -- plain `ls` gives chronological sequence.
+  # The interface is in the name because one VM can be captured on more
+  # than one mirror port, and two such captures starting in the same
+  # second would otherwise collide.
+  #
+  # file_prefix is a literal, not derived from anything. Change it if
+  # these captures share a destination with another collector's output.
+  file_prefix: internal
+  # Which name to use for directories and filenames:
+  #   auto      [vm_names].map, else the live libvirt domain, else the
+  #             inventory name  (recommended)
+  #   libvirt   require the libvirt/map name; warn and fall back if absent
+  #   inventory always ext-vm3 / int-vm1 etc.
+  # The OVS capture port and PID file always use the INVENTORY name, so
+  # renaming a domain never orphans a running capture.
+  naming: auto
+
+# ----------------------------------------------------------------------------
+# [diagnose] -- ovndiagnose.sh (what "healthy" looks like)
+# ----------------------------------------------------------------------------
+diagnose:
+  # The router port on host-if's own segment -- what the live ARP test
+  # in section 8 should get a reply from.
+  gateway: 172.31.1.10
+  lrp_int: lrp-int-vm
+  # pg_expected_members: how many ports pg_isolated should hold.
+  #
+  # LEAVE IT UNSET. It is now derived from [vm_isolation].isolated_vms,
+  # which is the list that actually decides membership. Hardcoding it here
+  # meant two places had to be edited together, and when ext-vm1 was added
+  # to the isolation list this key stayed at 4 and diagnose reported a
+  # correct deployment as drifted.
+  #
+  # Set it only to assert a number deliberately different from that list;
+  # diagnose warns when the two disagree.
+  # pg_expected_members: 5

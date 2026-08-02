@@ -1,0 +1,25 @@
+#!/usr/bin/env python3
+"""
+ovnctl -- entry point for the OVN suite.
+
+Runs straight from a checkout with no installation:
+
+    sudo ./ovnctl diagnose
+
+The package directory sits beside this file, so put it on sys.path
+explicitly rather than relying on the caller's working directory --
+`sudo` resets the environment and the suite is normally invoked by
+absolute path from cron or a systemd unit.
+"""
+
+import os
+import sys
+
+_HERE = os.path.dirname(os.path.abspath(os.path.realpath(__file__)))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+from ovnsuite.cli import main  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(main())

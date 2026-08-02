@@ -1,0 +1,1200 @@
+# ovnctl — File Reference
+
+A per-file description of the ovnctl suite: a Python port of an OVN/OVS
+deployment, diagnostic and teardown shell suite. Single executable, one
+subcommand per original script, every subcommand split into named steps.
+
+Python 3.9+, standard library only. No PyYAML, no third-party packages.
+
+---
+
+## 1. File tree
+
+```
+<root>/
+├── ovnctl                          entry point (runs from a checkout, no install)
+├── README.md                       user-facing guide
+│
+├── configs/
+│   ├── ovn-settings.yaml           the single source of truth
+│   └── ovn-internal-ranges.conf    legacy fallback range list
+│
+├── state/
+│   └── ovn-deploy-state            deployment tracker (generated at runtime)
+│
+└── ovnsuite/
+    ├── __init__.py                 package docstring + __version__
+    ├── cli.py                      argparse root, dispatch, exit codes
+    ├── config.py                   settings parser + in-place editors
+    ├── context.py                  logging, dry-run, command execution
+    ├── state.py                    the deployment tracker
+    ├── paths.py                    split-vs-flat layout resolution
+    ├── netcalc.py                  CIDR maths
+    ├── steps.py                    the step framework
+    ├── ovn.py                      read-only ovs-vsctl / ovn-nbctl / ovn-sbctl wrappers
+    ├── inventory.py                the VM inventory and its selectors
+    ├── libvirtutil.py              virsh domain/interface lookups
+    ├── identity.py                 chassis identity (system-id) management
+    │
+    └── commands/                   one module per original script
+        ├── setup.py                ovn-setup.sh
+        ├── localnet_internal.py    ovn-localnet-internal.sh
+        ├── localnet_external.py    ovn-localnet-external.sh
+        ├── vm_config.py            ovn-vm-config.sh
+        ├── vm_isolation.py         ovn-vm-isolation.sh
+        ├── vm_attach.py            ovn-vm-attach.sh
+        ├── acl.py                  ovn-acl.sh
+        ├── acl_audit.py            `acl --audit` conformance engine
+        ├── pcap.py                 ovn-pcap.sh
+        ├── diagnose.py             ovn-diagnose.sh
+        ├── reconcile.py            (new — no shell ancestor)
+        ├── delete.py               ovndelete.sh
+        ├── deploy.py               ovn-deploy.sh
+        ├── runbook.py              ovn-runbook.sh
+        └── show.py                 tools/ovn-show
+```
+
+Both layouts the shell suite supported still work: `configs/` + `state/`
+beside the executable (split), or everything flat in one directory.
+
+### Layering
+
+Nothing below a line imports from above it.
+
+```
+commands/*          ← the work
+    ↓
+identity, inventory, libvirtutil, ovn, netcalc, steps   ← domain helpers
+    ↓
+context, config, state                                  ← execution + data
+    ↓
+paths                                                   ← where things live
+```
+
+`cli.py` sits outside this stack: it builds the parser, constructs the
+`Ctx`, and dispatches into `commands/`.
+
+---
+
+## 2. Entry point and configuration
+
+### `ovnctl`
+
+A 25-line shim. Resolves its own real path, inserts that directory at the
+front of `sys.path`, imports `ovnsuite.cli.main`, and exits with its return
+code.
+
+The explicit `sys.path` manipulation is the point: `sudo` resets the
+environment, and the suite is normally invoked by absolute path from cron
+or a systemd unit, so relying on the caller's working directory would
+break both cases. Nothing needs installing; `pip install .` provides the
+same `ovnctl` command on `PATH` if wanted.
+
+### `README.md`
+
+The operator-facing guide. Covers the layout, the command mapping from
+shell script to subcommand, the step-selection flags, the global flags,
+the output contract, reboot survival, and — most usefully for anyone
+maintaining this — a section enumerating the behavioural fixes carried in
+the port (see §6).
+
+### `configs/ovn-settings.yaml`
+
+The single source of truth. Sixteen sections:
+
+| section | consumed by |
+|---|---|
+| `topology` | shared names (`br_int`, `ls_int`, `ls_ext`, `ls_host`, `lr_core`, `host_if`) — identity, not tuning |
+| `setup` | external-ids, encap, `system_id`, the three router ports and the host interface |
+| `localnet_internal` | the workstation-LAN uplink bridge, transit subnet, gateway priority |
+| `localnet_external` | the split subnet (and the legacy second-NIC keys, if still present) |
+| `internal_ranges` | "what counts as ours" |
+| `external_ranges` | positively-declared external space |
+| `engagement` | per-job client subnets, `priority_target` |
+| `shadow_ranges` | shadow address space |
+| `policy` | the reroute policy tier priorities and `fail_on_unresolved_overlap` |
+| `vm_config` | `internal_vms` / `external_vms` — `"name uuid mac ip"` per entry |
+| `vm_isolation` | `isolated_vms` — `"name uuid ip"` (no MAC) |
+| `acls` | port group definitions, port sets, declarative rules |
+| `acl_log` | where `acl_log` records land |
+| `vm_names` | display-name mapping |
+| `pcap` | capture directory, targets, rotation, snaplen, mirror prefix |
+| `diagnose` | check tuning |
+
+The file header documents the format constraints it must stay inside: two
+levels only, `key: value` at 2-space indent, lists as `key:` followed by
+4-space `- "item"` entries, comments after unquoted values only, no
+anchors, no deeper nesting, no multi-line values.
+
+### `configs/ovn-internal-ranges.conf`
+
+A legacy bash array — `OUR_INTERNAL_RANGES=( ... )` — retained as a
+fallback source for the internal range list when `[internal_ranges]` is
+absent.
+
+Its long comment header is the load-bearing part: the external-to-us
+network reachable through the ASA also uses RFC1918 addressing, so
+"is it RFC1918?" is not a valid test for "is it ours?". A blanket
+`10/8 + 172.16/12 + 192.168/16` exclusion would either misroute partner
+traffic through the internal path, or block the isolated VMs' only
+legitimate path. Hence an explicit list.
+
+The suite **parses** this file rather than sourcing it, so a stray command
+in a config file cannot execute.
+
+### `state/ovn-deploy-state`
+
+Generated, not authored. One flag per line:
+
+```
+key <ISO-8601 timestamp> boot=<kernel boot id>
+```
+
+Written by each command on completion, removed by `--remove`, truncated by
+`ovnctl delete`. See `state.py`.
+
+---
+
+## 3. Core library — `ovnsuite/`
+
+### `__init__.py`
+
+Package docstring describing the expected on-disk layout and the
+subcommand/step model. Defines `__version__ = "2.0.0"`, exported through
+`ovnctl --version`.
+
+### `paths.py` (85 lines)
+
+Layout resolution. Ports `_ovn_pick` / `_ovn_find_settings` /
+`_ovn_find_state` from the shell suite.
+
+| function | returns |
+|---|---|
+| `suite_root()` | parent of the package directory, or `$OVN_ROOT` |
+| `conf_dir()` | `<root>/configs` if it is a directory, else `<root>` |
+| `state_dir()` | `<root>/state` if either `state/` or `configs/` exists, else `<root>` |
+| `settings_file()` | `<conf_dir>/ovn-settings.yaml` |
+| `ranges_file()` | `<conf_dir>/ovn-internal-ranges.conf` |
+| `state_file()` | `<state_dir>/ovn-deploy-state` |
+
+Environment overrides, each taking precedence over the derived value:
+`OVN_CONFIG_FILE`, `OVN_CONF_DIR`, `OVN_STATE_DIR`, `OVN_STATE_FILE`,
+`OVN_ROOT`, `INTERNAL_RANGES_CONF`.
+
+The `state_dir()` logic deliberately checks for a *sibling* `configs/`:
+that proves the split layout is in use, so `state/` is the right home even
+if it has not been created yet.
+
+### `config.py` (355 lines)
+
+Loader for `ovn-settings.yaml` — a faithful port of the awk parser from
+`ovn-config.sh`, **not** a general YAML reader.
+
+That is a deliberate decision, documented in the module docstring. The
+real settings file contains constructs a strict parser and a full YAML
+parser disagree on: bare values with a trailing `#`, `key: []` acting as a
+list header that later `- item` lines still append to, duplicated keys
+inside commented-out examples. Matching the original parser exactly means
+a config that worked under the shell suite works here unchanged.
+
+**Parsing.** Three regexes drive it — a section line, a list item, a key
+line. Every value lands under a `(section, key)` tuple holding either a
+`str` or a `list[str]`. `_strip_value()` ports the awk `strip()`: a quoted
+value ends at its *closing* quote and the rest of the line is discarded,
+without which a trailing comment containing a quote is swallowed into the
+value.
+
+**Accessors.**
+
+| method | semantics |
+|---|---|
+| `cfg(section, key)` | **required** — raises `ConfigError` naming the key |
+| `cfg_opt(section, key, default)` | genuinely optional |
+| `cfg_int` / `cfg_int_opt` / `cfg_bool` | typed variants |
+| `cfg_array(section, key)` | list, or `None` if absent/empty (lets callers keep their own defaults) |
+| `cfg_list(section, key)` | same, but always a list |
+| `require(*"section:key")` | validates every required setting **before** anything is changed, reporting all misses at once |
+
+There are no built-in defaults anywhere. A missing key stops the run with
+a message naming it, rather than silently deploying something that does
+not match the yaml the operator is reading.
+
+**In-place editors.** `scalar_set`, `list_add`, `list_del` let a command
+update the settings file at runtime (e.g. `localnet-external --add-target`
+adding an engagement subnet) without hand-editing. They write via a
+temp-file rename and operate on the same strict subset the parser
+understands. `list_add` rewrites `key: []` to `key:` so the appended item
+parses.
+
+**`load_legacy_ranges(path)`.** Regex-extracts `OUR_INTERNAL_RANGES=( ... )`
+from the legacy conf file — parsing, not sourcing.
+
+### `context.py` (378 lines)
+
+The port of `ovn-common.sh` and `ovn-dryrun.sh`. Everything shared by
+every subcommand.
+
+**The output contract**, unchanged from the shell suite:
+
+| condition | output |
+|---|---|
+| success | one summary line, nothing else |
+| `-v` | full step-by-step narration |
+| `--dry-run` | the commands that would run, and nothing else |
+| warnings | always, on stderr |
+| errors | always, on stderr, then exit non-zero |
+
+**`Ctx`** — the per-run dataclass holding flags (`verbose`, `dry_run`,
+`listing`), counters (`changes`, `warnings`), the query timeout, and the
+lazily-loaded `Config`. It exposes:
+
+- *Config pass-throughs* — `cfg`, `cfg_opt`, `cfg_int`, `cfg_bool`,
+  `cfg_array`, `cfg_list`, `require_cfg` — so command modules read the way
+  the shell did.
+- *Output* — `log` (narration, `-v` only), `say` (must-see even on a quiet
+  run), `out` (tables), `warn`, `err`, `die`, `finish` (the single `OK:`
+  line), `dr_head` / `dr_banner` (dry-run section headings).
+- *Execution* — `run()` for **mutating** commands (printed under
+  `--dry-run`, executed otherwise, increments `changes`) and `q()` /
+  `qout()` for **read-only queries**.
+- *Preconditions* — `require_root`, `require_cmd`, `have`.
+- *systemd* — `unit_exists`, `unit_active`.
+
+Two details in here carry real weight:
+
+- **Queries are never wrapped by dry-run.** The printed command list has
+  to reflect what would actually change *given the current state of the
+  system*, which means the queries that decide that must really run.
+- **Queries are always bounded** (15s default). `ovn-nbctl` and
+  `ovn-sbctl` wait on the db forever by default, and the commands that
+  query them are exactly the ones run while that db is unreachable. A
+  timeout yields a normal failed `Result` with rc 124 (as `timeout(1)`
+  uses), so every existing `if not res.ok` path already handles it.
+
+`listing=True` (set for `--list-steps`) skips the root and command
+preconditions: the step listing is documentation, and documentation you
+can only read on a healthy deployment is not much use when the deployment
+is broken.
+
+**`Abort`** — fatal error with a pre-formatted message and an exit code;
+`cli.main` turns it into the process status.
+
+**`Result`** — `returncode` / `stdout` / `stderr`, with `.ok`, `.lines`,
+and `__bool__` so `if ctx.run(...)` reads naturally.
+
+**`Colour`** — ANSI codes, but only when stdout is a TTY and `NO_COLOR` is
+unset. `--no-color` exports `NO_COLOR`, so honouring the variable covers
+the flag, and a redirected run stays plain text without anyone
+remembering.
+
+**`trace_verdict(output)`** — the single most consequential function in
+the file. Turns `ovn-trace` output into `ALLOW` / `DROP` / `UNKNOWN`.
+
+northd compiles an ACL drop into several different shapes depending on
+options unrelated to the verdict: bare `drop;` on a stateless pipeline,
+`ct_commit { ct_mark.blocked = 1; }` on the established branch of a
+stateful one, and — once the ACL carries a name or logging — the log
+action with the drop left implicit *as a C comment*. Matching only
+`drop;` reports the last two as ALLOW. Naming the ACLs is what made every
+isolation check report "not blocked" on a deployment that was enforcing
+correctly.
+
+`UNKNOWN` exists for the same class of reason: this used to return ALLOW
+for any unrecognised output, including empty output, so a trace that
+timed out or failed to parse was indistinguishable from a permitted
+packet. ALLOW now requires positive evidence — real output always contains
+an `ingress(dp=...` line.
+
+`shquote()` / `format_cmd()` render argv lists shell-safely but readably
+for the dry-run listing.
+
+### `state.py` (196 lines)
+
+The deployment tracker (port of `ovn-state.sh`).
+
+Six keys, in documented run order: `setup`, `localnet-internal`,
+`localnet-external`, `vm-config`, `vm-isolation`, `acls`.
+
+**The tracker is advisory.** Commands never hard-fail because a flag is
+missing — the OVN database itself is always the source of truth. The
+tracker records what was *intended*, so `diagnose` can tell "not
+configured yet" apart from "broken".
+
+**`Tracker`** — `mark`, `unmark`, `has`, `clear`, `exists`, `show`,
+`flags`, plus the boot-awareness methods below. `exists()` distinguishes
+"tracking is in use and nothing is deployed" from "tracking has never been
+used".
+
+**Boot ids.** Each entry records `/proc/sys/kernel/random/boot_id`. The
+tracker records intent and lives on disk, so it survives a reboot
+unchanged — which meant a post-reboot `diagnose` read `setup=True`, gated
+away the checks that would have caught the problem, and reported a
+deployment no longer realised on the running system. `from_earlier_boot()`
+and `any_from_earlier_boot()` tell "deployed and live" apart from
+"deployed during an earlier boot, runtime half may be gone". An unknown id
+on either side returns False — absence of evidence must not manufacture a
+warning.
+
+**Dry-run safety.** Writes are no-ops when `ctx.dry_run` is set. The shell
+suite called `state_mark` unconditionally, so `./ovn-setup.sh --dry-run`
+left a `setup` flag behind and every later diagnose believed the
+deployment existed.
+
+**`record(ctx, key, runner)`** — marks a component deployed *only if the
+whole command ran*. Recording `setup` after `--only switches` would tell
+diagnose to expect a router, gateway ports and a host interface that were
+never created, and report each as a failure rather than "not deployed
+yet". A partial run leaves the flag alone and logs why.
+
+### `steps.py` (128 lines)
+
+The step framework — the part the shell suite could not do.
+
+`Step` is a `(name, desc, fn)` dataclass. `StepRunner` collects them via
+`add()` and exposes:
+
+- `list_steps()` — numbered listing with descriptions
+- `select(only, skip, start)` — resolves the selection flags
+- `run(args)` — executes, returning `False` if it only listed
+
+Steps always execute in **declaration order** regardless of the order they
+are named on the command line. Selection changes *which* steps run, never
+the sequence, because the sequence is the part that has to hold.
+
+`runner.partial` is set when a subset ran; `state.record()` reads it to
+decide whether claiming the component as deployed would be honest.
+
+`add_step_args(parser)` attaches `--list-steps`, `--only A,B`, `--skip A,B`
+and `--from A` to a subcommand parser.
+
+An unknown step name raises `Abort` listing the known ones.
+
+### `netcalc.py` (113 lines)
+
+IPv4 CIDR arithmetic (port of `ovn-netcalc.sh`), implemented on stdlib
+`ipaddress`.
+
+It exists for one reason: the deployment declares both "our internal
+ranges" and "external-via-ASA ranges", and both may use RFC1918. If those
+lists intersect, a destination-based routing policy becomes ambiguous —
+one prefix cannot have two next-hops. Silently absorbing that ambiguity
+presents as "that host is mysteriously unreachable", so every command that
+builds policies or ACLs calls in here first and says so out loud.
+
+| function | purpose |
+|---|---|
+| `cidr_valid` / `cidr_bounds` | parse and validate (bare IP → /32; host bits masked off, not rejected) |
+| `cidr_overlap` / `cidr_contains` | the two containment tests |
+| `cidr_describe_overlap` | the intersection as `first - last`, for the error message |
+| `find_overlaps(a, b)` | every colliding pair across two lists |
+| `validate_ranges` | the entries that are not valid CIDRs |
+| `ip_in_ranges` | membership test |
+| `set_literal` | build an OVN address-set literal `{a,b,c}` |
+
+### `ovn.py` (542 lines)
+
+Thin helpers around `ovs-vsctl`, `ovn-nbctl`, `ovn-sbctl` and `ovn-trace`.
+
+Almost all read-only. Mutating commands stay as explicit
+`ctx.run("ovn-nbctl", ...)` calls in the command modules so they remain
+visible in the `--dry-run` listing exactly as the shell version printed
+them.
+
+**ovs-vsctl** — `br_exists`, `list_br`, `list_ports`, `iface_type`,
+`external_id`, `has_external_id`, `iface_for_iface_id`, `iface_id_map`
+(one query for the whole Interface table), `iface_id_of`, `mirror_exists`.
+
+**ovn-nbctl** — existence probes (`lr_exists`, `ls_exists`, `lsp_exists`,
+`lrp_present`), port-group access (`pg_uuid`, `pg_exists`, `pg_members`),
+`policy_uuids`, `policies_with_match`, `port_security`, `acl_list`.
+
+**`pg_snapshot(ctx)`** — every port group with members and ACLs resolved,
+in four queries regardless of group count rather than three per group.
+`ports` and `acls` are fetched separately on purpose: asking for both
+reference columns at once returned unreliable results for one of them, and
+a silently short member list reads as drift that isn't there.
+`Port_Group.ports` holds row uuids, translated back to logical port names
+here because that is what the inventory and the yaml speak.
+
+**`acl_index(ctx)`** — keyed on `(direction, priority, match)`, which is
+what `ovn-nbctl --may-exist` treats as an ACL's identity, so it answers
+"have I already created this one, and does it carry the name, logging and
+meter I meant it to?".
+
+**`add_acl(...)`** — the one mutating helper here, because it carries a
+version-compatibility fallback two command modules would otherwise each
+copy. `ovn-nbctl` grew `--name` for `acl-add` alongside the ACL table's
+name column; support is probed once per process by *trying* it, since a
+version check would have to map release numbers to behaviour and the
+command itself is authoritative. A failure is only treated as a version
+problem if the complaint names the option — any other failure surfaces as
+it always did rather than being silently retried into a differently-broken
+state.
+
+**ovn-sbctl** — `chassis_names`, `first_chassis`, `chassis_uuid_names`,
+`port_binding_chassis`, `port_binding_chassis_name` (resolves the *name*,
+not merely "is one set"), `port_binding_type`, `port_binding_ports`.
+
+**OVSDB JSON helpers** — `_json_rows`, `_json_map`, `_scalar` (an unset
+optional column arrives as `['set', []]`; a bare `str()` of that yields
+the literal text), `uuid_list`, `ref_is_set`, `nb_json`, `sb_json`,
+`sb_records`.
+
+**`sync_sb(ctx)`** — blocks until northd has compiled NB into SB.
+`ovn-nbctl` returns as soon as the Northbound db is written; northd
+compiles asynchronously; `ovn-trace` reads the *Southbound* db. A trace
+run immediately after creating an ACL can therefore legitimately report
+the behaviour from before it existed. That is a race, not a flaky test,
+and on a busy or freshly-purged db the window is comfortably wide.
+`--wait=sb sync` closes it.
+
+**`trace(ctx, datapath, expr)`** — runs `ovn-trace` with a 60s timeout
+(`TRACE_TIMEOUT`) and returns combined stdout+stderr. The default 15s
+query ceiling timed traces out routinely on large deployments, and a
+timed-out trace produced empty output every caller then read as ALLOW.
+Pair with `context.trace_verdict`.
+
+### `inventory.py` (142 lines)
+
+The VM inventory, shared by `vm-config`, `vm-attach`, `vm-isolation`,
+`acl`, `pcap` and `diagnose`.
+
+Reads `[vm_config].internal_vms` / `.external_vms` (`"name uuid mac ip"`)
+and `[vm_isolation].isolated_vms` (`"name uuid ip"`, no MAC).
+
+`VM` is a frozen dataclass: `name`, `uuid`, `mac`, `ip`, `group`
+(`internal`/`external`), `switch`, plus a `mac_lc` property.
+
+`Inventory` exposes `all`, `internal`, `external`, `isolated`,
+`non_isolated`, and the lookups `by_name`, `by_ip`, `by_uuid`, `by_mac`.
+
+**`select(selector)`** resolves the selector syntax used wherever a group
+of VMs is named:
+
+```
+all | internal | external | isolated | all-except-isolated
+names=vm1,vm2
+ips=1.2.3.4,5.6.7.8
+```
+
+An unknown selector or an unresolvable name/IP raises `Abort` rather than
+returning an empty list — silently returning nothing is how a port group
+ends up with no members and an ACL ends up applying to nothing.
+
+### `libvirtutil.py` (76 lines)
+
+virsh helpers. **libvirt is optional throughout the suite.**
+
+Taps are resolved from OVS by `iface-id` wherever possible, because
+ovn-controller binds a port by matching `external-ids:iface-id` on a local
+interface — OVS holds the definitive mapping, and it works on a host with
+no libvirt CLI at all. virsh is used to put a human-readable domain name
+on things, and as a fallback for a tap with no `iface-id` set.
+
+`DomIface(domain, tap, mac)`; `available`, `running_domains`,
+`domiflist` (parses `virsh domiflist`, skipping the two header lines),
+`interfaces` (every interface of every running domain in one pass),
+`mac_maps` (mac→tap and mac→domain).
+
+### `identity.py` (333 lines)
+
+Chassis identity — the one piece of state that must not drift.
+
+An OVN chassis is identified by `external-ids:system-id` in the local OVS
+db. Everything downstream is keyed off that name: the `Chassis` row in the
+SB db, every `Port_Binding.chassis` reference, every `Gateway_Chassis` pin
+in the NB db. Change the name and all of it silently stops matching — the
+bindings and pins still exist, they just point at a chassis that no longer
+runs anything.
+
+Two things make the name drift across a reboot, and the suite used to walk
+into both:
+
+1. `ovs-ctl start --system-id=random` (how `openvswitch.service` is
+   normally invoked) reads `/etc/openvswitch/system-id.conf`, generating a
+   random UUID if the file is absent, and writes it into
+   `external-ids:system-id` at **every** boot. Whatever setup put there is
+   overwritten.
+2. Falling back to `hostname` when no id is configured — hostname vs FQDN
+   vs a DHCP-supplied name is exactly the kind of thing that changes
+   underneath a machine.
+
+So the canonical name comes from `[setup].system_id`, is written to **both**
+`external-ids` and `system-id.conf`, and is re-asserted on every run.
+
+| function | purpose |
+|---|---|
+| `configured_opt` / `configured` | the canonical name; the latter aborts with instructions if unset |
+| `local` | `external-ids:system-id` as it stands right now |
+| `conf_file_value` | the id ovs-ctl will re-assert at the next boot |
+| `registered` / `is_registered` | chassis names in the SB db |
+| `stale` | registered chassis that are not the canonical one |
+| `write_system_id_conf` | persist where ovs-ctl looks at boot |
+| `assert_external_ids` | reconcile all four keys, individually |
+| `restart_controller` | via systemd, falling back to `ovn-ctl` |
+| `wait_for_chassis` | block until the name appears in the SB db |
+| `purge_stale_chassis` | **destructive, opt-in** — remove non-canonical rows |
+| `pin_target` | the chassis a gateway port should be pinned to |
+| `repin_gateway` | pin, removing any pin to another chassis |
+| `gateway_pins` / `stale_pins` | audit the `Gateway_Chassis` table |
+
+Notes worth carrying:
+
+- `assert_external_ids` is deliberately **not** gated on "is ovn-remote
+  already set". conf.db is persistent, so after the first deploy that gate
+  is always true and the other three keys — system-id above all — are
+  never looked at again. Each key is compared and set individually.
+- `restart_controller` exists because ovn-controller reads
+  `external-ids:system-id` once, at startup. Changing it under a running
+  controller leaves the process registered as the old name, which looks
+  fine to every check that only asks whether *a* chassis exists.
+- `pin_target` aborts if the configured name is not registered. A pin to
+  an unregistered chassis is a silent black hole: northd accepts it, the
+  `cr-` port never binds, nothing reaches the physical network.
+- `repin_gateway` deletes old pins explicitly because
+  `lrp-set-gateway-chassis` **adds** a pin rather than replacing one — a
+  drifted host otherwise ends up with both.
+- `purge_stale_chassis` also sweeps `Chassis_Private` by uuid, since
+  `chassis-del` leaves it behind on some versions and a name containing
+  characters the CLI won't take never matched at all.
+
+### `cli.py` (171 lines)
+
+The single entry point. Builds the argparse root, registers every
+subcommand by importing `commands/<name>.py` and calling its `register()`,
+constructs the `Ctx`, and dispatches.
+
+**Global flags**: `-v/--verbose`, `-n/--dry-run`, `--config PATH`,
+`--state-file PATH`, `--no-color`, `--version`.
+
+**`_split_globals(argv)`** hoists post-subcommand global flags to the
+front. argparse puts global options on the root parser only, so
+`ovnctl setup -n` would otherwise be an error — and everyone types it that
+way. Anything after a bare `--` is left alone.
+
+**`_apply_path_overrides`** — `--config` and `--state-file` are friendlier
+spellings of the environment variables the path resolver already honours,
+so they are simply exported.
+
+**`run_argv(argv)`** is public so `deploy` and `runbook` can re-enter the
+CLI in-process rather than re-executing the interpreter.
+
+**Exit codes**, produced by `main()`:
+
+| code | meaning |
+|---|---|
+| 0 | success |
+| 1 | failure, including `diagnose` finding problems |
+| 2 | usage error (no subcommand) |
+| 130 | interrupted |
+
+`BrokenPipeError` is caught and returns 0 — `ovnctl show | head` is not an
+error worth a traceback.
+
+---
+
+## 4. Command modules — `ovnsuite/commands/`
+
+Every module follows the same shape: `NAME`, `HELP`, an optional
+`REQUIRED_CFG` tuple, a `register(subparsers)` function, a class holding
+the work as one method per step, and a `main(ctx, args)` that validates
+config, checks preconditions, builds a `StepRunner`, runs it, and records
+state.
+
+### `setup.py` (444 lines) — `ovnctl setup`
+
+Port of `ovn-setup.sh`. Base topology for a single-node OVN environment.
+
+Steps:
+
+1. `external-ids` — configure OVS `external-ids` (via `identity.assert_external_ids`)
+2. `ovn-controller` — start the control plane, wait for br-int
+3. `switches` — create `ls-int-vm`, `ls-ext-vm`, `ls-host`
+4. `logical-router` — create `lr-core` and its gateway ports
+5. `attach-switches` — attach each switch to the router
+6. `host-interface` — create `host-if`, address it, add routes
+
+`REQUIRED_CFG` covers 21 keys across `[setup]` and `[topology]`.
+`system_id` is required with no fallback — there used to be a
+`socket.gethostname()` default here, and a hostname that changes between
+boots renames the chassis, after which every `Port_Binding` and gateway pin
+references an identity nothing is running under.
+
+The class also carries `_br_int_diagnosis` (explains *why* br-int never
+appeared, rather than just timing out), `_kernel_mac` / `_fix_kernel_mac`,
+`_fix_addresses`, `_add_routes` and `_verify_and_report`.
+`self.identity_changed` is set when `external_ids()` had to rewrite
+system-id, so later steps and `reconcile` know the chassis was just
+re-registered under a different name.
+
+### `localnet_internal.py` (337 lines) — `ovnctl localnet-internal`
+
+Port of `ovn-localnet-internal.sh`. Gives the VMs behind `lr-core` a path
+to the rest of the internal infrastructure via a localnet port bridging OVN
+out to a physical NIC.
+
+**This is not an internet gateway** — no NAT is configured, traffic leaves
+and returns with real `172.31.x.x` addresses.
+
+Steps:
+
+1. `check-router` — verify `lr-core` exists
+2. `bridge-nic` — create `br-internal` and enslave the NIC
+3. `bridge-mapping` — extend `ovn-bridge-mappings`
+4. `transit-switch` — transit switch + localnet port
+5. `attach-router` — router port + gateway chassis pin
+6. `routes` — the `0.0.0.0/0` route to the first-hop firewall
+7. `confirm-no-nat` — warn if NAT is configured on `lr-core`
+
+`--remove` tears down just this gateway. The `phys_nic` setting must be a
+*spare* NIC cabled into the workstation LAN segment — pointing it at the
+management NIC costs you the SSH session, so confirm from console/IPMI
+first.
+
+### `localnet_external.py` (705 lines) — `ovnctl localnet-external`
+
+Port of `ovn-localnet-external.sh`. Logical router **policy** that forces
+traffic to the ASA even when the ordinary route table would have kept it
+inside OVN.
+
+**What changed from the shell version.** The shell script still built a
+second physical uplink (`br-asa` on its own NIC, `ls-ext-asa`, `lrp-asa`)
+and called `require_cfg` for keys that no longer exist in the settings file
+— `[localnet_external].br_asa`, `.phys_nic`, `.ln_asa`, `.lrp_asa`,
+`.ls_ext_asa`, `.physnet_label`, `.policy_priority`,
+`.gateway_chassis_priority` and the whole `[asa_addressing]` section. The
+yaml documents that section as policy-only since the second NIC was
+removed. As written, the script aborted on a clean checkout.
+
+So: the policy tiers are the primary path and always run. The legacy
+physical-uplink steps still exist and run **only** if those keys are
+actually present, so a deployment that still has the second NIC keeps
+working unchanged.
+
+Priority tiers, higher evaluated first:
+
+| priority | tier | meaning |
+|---|---|---|
+| 300 | source-override | listed VMs go to the ASA regardless of destination |
+| 250 | engagement | per-job client subnets |
+| 200 | shadow | anything addressed into shadow space → ASA |
+| 150 | external | positively-declared external ranges → ASA |
+| 100 | split | "src subnet AND not internal" |
+
+Steps: `check-router`, `validate-ranges`, `bridge-nic` (legacy),
+`bridge-mapping` (legacy), `transit-switch` (legacy), `attach-router`
+(legacy), `policy`.
+
+Additional modes: `--trace SRC DST` (prove a tier does what you think),
+`--remove`, and the engagement-target editors `--list-targets`,
+`--add-target CIDR`, `--del-target CIDR`, `--clear-targets`, which write
+back to the settings file via `config.list_add` / `list_del` and then
+reapply the policy.
+
+`_validate_next_hop()` implements a rule the yaml documented but nothing
+ever checked: `next_hop` must sit inside `transit_subnet`. It is now an
+error when set explicitly and off-link, and a warning when inherited from
+`lan_gateway`.
+
+### `vm_config.py` (161 lines) — `ovnctl vm-config`
+
+Port of `ovn-vm-config.sh`. Creates the OVN logical switch ports for the
+VMs in `[vm_config]`.
+
+UUIDs and MACs come from the settings file and are pinned to the libvirt
+domain XMLs — keep the two in sync. The logical switch port is **named
+after the VM's UUID**, which is also what belongs in
+`<virtualport><parameters interfaceid='...'/>`, so libvirt, OVS and OVN all
+agree on one port identity. Every port is tagged with
+`external-ids:vm-name` for later correlation.
+
+Steps: `check-switches`, `internal-ports`, `external-ports`. `--remove`
+removes these ports only.
+
+Under `-v`, `print_summary()` emits the inventory table plus the exact
+libvirt interface XML block to paste into each domain.
+
+### `vm_isolation.py` (628 lines) — `ovnctl vm-isolation`
+
+Port of `ovn-vm-isolation.sh`. Fully isolates the listed VMs from all
+internal infrastructure — no other internal host, VM, or the gateway itself
+can reach them, and they cannot reach anything internal. Their only path
+anywhere is out through `lr-core`'s reroute policy to the ASA; console
+access stays available via VNC/KVM regardless of network state.
+
+Mechanism: an OVN port group with two drop ACLs (`from-lport` and
+`to-lport`) matching the ranges in `[internal_ranges]` — **not** all of
+RFC1918, because the external-to-us network these VMs are allowed to reach
+also uses RFC1918 addressing.
+
+Two properties worth knowing:
+
+- Same-subnet (L2) traffic is caught too, since `from-lport`/`to-lport`
+  ACLs apply before routing decisions — lateral movement to a non-member
+  on the same broadcast domain is blocked exactly like anything else.
+- ARP is not touched (the match is scoped to `ip4`), so L2 resolution of
+  the gateway's MAC still works; it just never results in permitted IP
+  traffic.
+
+Steps: `check-ports`, `port-group`, `acls`, `verify-scope`.
+
+`verify_scope()` proves non-members are unaffected — both statically
+(matches are scoped with `inport`/`outport == @group`) and live, by
+tracing a real non-member. `_explain_unblocked()` renders a readable
+explanation when a trace comes back ALLOW where DROP was expected.
+`--trace SRC DST` and `--remove` are the other modes.
+
+### `vm_attach.py` (252 lines) — `ovnctl vm-attach`
+
+Port of `ovn-vm-attach.sh`. Re-attaches running VMs' tap interfaces to
+br-int with the correct `iface-id`, without restarting the guests.
+
+Why it exists: deleting br-int (as `ovnctl delete` does) detaches every
+running VM's tap from OVS. libvirt only plugs a tap in when a domain
+*starts*, so after a teardown + redeploy the guests keep running with a tap
+attached to nothing — their ports show `DOWN (no chassis)` forever.
+Rebooting works only because it restarts the guests.
+
+Taps are matched to logical ports **by MAC** using `[vm_config]`, so a
+mismatch is reported rather than silently wired to the wrong port.
+
+Steps: `check-bridge`, `attach`, `wait`, `status`.
+
+`DEFAULT_TIMEOUT = 60` (`--timeout` overrides). This used to be a flat
+3-second sleep followed by an immediate status print, which is why
+`ovnctl deploy` could report every VM as `DOWN (no chassis)` on a
+deployment that was fine thirty seconds later. Claiming is not instant, and
+it is slowest in exactly the case where this command matters most: right
+after `delete --purge-db`, when ovn-controller is rebuilding its whole view.
+
+`--status` shows what is attached vs not and changes nothing.
+
+### `acl.py` (727 lines) — `ovnctl acl`
+
+Port of `ovn-acl.sh`. Applies the declarative rules in `[acls]`.
+
+Port groups are built from the VM inventory (so membership can never drift
+from `[vm_config]`), and every rule is scoped to its group with
+`inport`/`outport == @group` — without that scoping an ACL applies to
+every port on the switch.
+
+Rule format:
+
+```
+<name> <direction> <priority> <action> <group> <spec>...
+
+direction  to-lport    evaluated on the way IN to a group member
+           from-lport  evaluated on the way OUT of a group member
+action     allow | allow-related | drop | reject
+spec       src=CIDR[,CIDR]   dst=CIDR[,CIDR]   src=any
+           src=internal / dst=internal   expands to [internal_ranges]
+           tcp=PORT | tcp=@portset       udp=PORT | udp=@portset      icmp
+           log             log every packet this rule matches
+           log=SEVERITY    the same, at alert|warning|notice|info|debug
+           meter=NAME      rate-limit this rule's logging
+```
+
+Higher priority wins. Anything with no matching rule is **allowed** (OVN's
+default), so these rules only constrain what they name.
+
+Logging is per rule and off by default — on a busy segment an allow rule
+that logs is a firehose. `log_sink()` writes an rsyslog drop-in that files
+`acl_log` records into `[acl_log].directory`; the `& stop` in the template
+matters, because without it every ACL record is *also* appended to
+`/var/log/messages`, which is how a chatty allow rule takes out the system
+log rather than just its own file.
+
+Steps: `port-groups`, `log-meter`, `rules`, `log-sink`.
+
+Modes (mutually exclusive): `--remove`, `--verify` (ovn-trace the key
+allow/deny cases), `--list`, `--audit`.
+
+Two ordering decisions in `main()`: `--audit` runs *before* the
+`acls.enabled` check, because "we turned ACLs off — is the policy actually
+gone?" is exactly what an audit should answer; and `--list-steps` is
+answered even when the feature is switched off, or "what would this do?"
+becomes unanswerable precisely when you are deciding whether to switch it
+on.
+
+`name_existing_rules()` back-fills names onto ACLs created before naming
+was supported — relevant because an unnamed logging ACL produces log
+records nobody can trace back to a rule.
+
+### `acl_audit.py` (567 lines) — `ovnctl acl --audit`
+
+The conformance engine. Every rule in `[acls].rules` is a test case.
+
+The expected match string is rebuilt with `ACLManager.build_match` — the
+same code that deploys it — so the audit cannot pass a rule the deployer
+would write differently. A separate reimplementation here would agree with
+the yaml and disagree with reality, which is the one failure mode an audit
+must not have.
+
+Three questions, in order:
+
+1. **Is the configuration sound?** Direction, priority range (0–32767),
+   action, port-set and port-group references, CIDR syntax, priority
+   collisions. No db access — a rule that cannot be right is worth catching
+   before asking whether it is deployed.
+2. **Is every configured rule in the NB db**, with the same direction,
+   priority, action and match?
+3. **Does the db hold anything the configuration does not account for?**
+   An ACL nobody declared is policy nobody reviewed. This matters more than
+   it looks: the deployer uses `acl-add --may-exist`, so *editing* a rule's
+   match adds a second ACL and leaves the original in force — and the old
+   one is invisible to every other command in the suite.
+
+Output contract: a pass is one line. A failure prints what was expected,
+what is actually there, and the command that fixes it, because whoever
+reads the failure is usually not whoever wrote the rule. `_norm()` makes
+the comparison whitespace-insensitive and `_first_diff()` reports the
+column where two matches diverge — a spacing difference is worth reporting,
+but not as the same failure as a genuinely different rule.
+
+Exit status is 1 if any check failed, so this can gate a deployment.
+
+### `pcap.py` (916 lines) — `ovnctl pcap`
+
+Port of `ovn-pcap.sh`. Captures traffic from VM logical ports using OVS
+port mirroring (SPAN).
+
+Per target VM:
+
+1. a dedicated internal capture port is created on br-int
+   (`<mirror_prefix>-<vm>`) — its name never changes, unlike the VM's tap
+2. an OVS mirror copies the tap's ingress **and** egress into it
+3. tcpdump writes rotated pcaps
+
+The capture survives a VM restart: only the mirror's source port needs
+re-pointing (`--restart`), while the tcpdump process and its output files
+stay put.
+
+**Layout.** Two directories under the one configured path:
+
+```
+<directory>/inflight/[<vm>/]     tcpdump's open, still-growing file
+<directory>/completed/[<vm>/]    closed files, nothing else
+```
+
+On rotation the hook moves the closed file across. Both sit on the same
+filesystem, so that move is a plain rename — atomic, with no window in
+which a partial file is visible under its final name. Whatever collects the
+captures takes everything in `completed/` and never has to work out which
+file tcpdump still has open. `_check_same_filesystem()` enforces the
+precondition.
+
+No compression, and no `chown` anywhere. Access is granted by POSIX ACL to
+the account tcpdump drops to (`-Z`); ownership and mode are left exactly as
+provisioning left them (`resolve_drop_user`, `grant_capture_dir`,
+`grant_rundir`).
+
+Modes rather than steps — `--start`, `--stop`, `--restart`, `--status`
+(default). `--list-steps` prints the mode list instead. PID files live
+under `/run/ovn-pcap`. `check_disk()` enforces `[pcap].min_free_mb` and
+`max_files`; `sweep_inflight()` reconciles leftovers from an unclean stop.
+
+### `diagnose.py` (1208 lines) — `ovnctl diagnose`
+
+Port of `ovn-diagnose.sh`. Walks the OVN/OVS stack layer by layer to find
+where connectivity is breaking. The largest module in the suite.
+
+**Tracker-aware.** Checks are gated on what has actually been deployed, so
+"gateway port missing" is only a FAIL if a localnet command recorded itself
+as run, and a clean SKIP otherwise. Conversely, ambiguous results become
+definitive: tracker says `localnet-internal` ran **and** no chassisredirect
+port exists = hard FAIL, no hedging. With no tracker file at all, every
+check runs unconditionally — the tracker is advisory, the OVN db remains
+the source of truth.
+
+Sixteen steps:
+
+| step | checks |
+|---|---|
+| `tracker` | deployment tracker state, including stale-boot entries |
+| `controller` | the ovn-controller service |
+| `br-int` | the integration bridge |
+| `external-ids` | OVS external-ids |
+| `chassis` | chassis registration in the SB db |
+| `port-bindings` | the host-if port binding |
+| `port-binding-sweep` | every port binding, and any missing chassis |
+| `chassisredirect` | gateway port bindings |
+| `gateway-pins` | gateway-chassis pins vs registered chassis |
+| `isolation` | isolation port group and its scope |
+| `acls` | micro-segmentation ACLs |
+| `port-security` | VM port security |
+| `range-overlap` | range overlap and the policy tiers |
+| `flows` | OpenFlow rules on br-int |
+| `host-if` | the host-facing OVS interface |
+| `live-arp` | live ARP/ping test of the gateway |
+| `summary` | the failure/warning tally |
+
+Result tags are `[ OK ]`, `[FAIL]`, `[WARN]`, `[SKIP]`. Exit status is 1 if
+anything failed.
+
+`check_chassisredirect` resolves the chassis **name** rather than merely
+checking one is set — `Port_Binding.chassis` survives a reboot, so a
+binding can name a chassis nothing is running under, and resolving the name
+is the difference between a live binding and a fossil.
+
+Three latent faults were fixed in the port: `check_isolation` referenced an
+undefined `_iso_vms`, silently breaking the live non-member proof; three
+calls passed a third argument to the two-argument `cfg()`, which exits on a
+miss; and `require_cfg` demanded `[localnet_external].br_asa` / `.phys_nic`,
+which no longer exist, so the whole script aborted before running a single
+check on a single-NIC host.
+
+### `reconcile.py` (394 lines) — `ovnctl reconcile`
+
+**No shell ancestor.** `deploy` builds a deployment and `delete` removes
+one; neither answers the question a reboot asks.
+
+What survives a reboot:
+
+- `conf.db` — bridges, ports, external-ids, iface-ids
+- the NB db — switches, routers, ACLs, gateway pins
+- the SB db — `Port_Binding` rows, *including their chassis column*, which
+  is why a stale binding reads as "up" long after it stopped meaning
+  anything
+
+What does not:
+
+- `external-ids:system-id`, which `ovs-ctl start --system-id=random`
+  rewrites from `/etc/openvswitch/system-id.conf` at every boot
+- the kernel side of `host-if`: link state, address, routes
+- any claim ovn-controller had on a VIF whose tap is recreated after it
+
+Steps: `external-ids`, `identity`, `gateway-pins`, `host-interface`,
+`claim-check`, `acl-logging`, `tracker`.
+
+Everything is idempotent; running it when nothing is wrong changes nothing.
+It reuses `setup.Setup` for the host-interface work rather than
+reimplementing it.
+
+`--repair-identity` additionally deletes stale chassis rows.
+`--install-unit` writes `/etc/systemd/system/ovn-reconcile.service`, ordered
+`After=ovn-controller.service openvswitch.service`, and enables it — the
+ordering matters because reconcile compares the registered chassis against
+the configured identity, and there is nothing to compare against until the
+controller has connected to the SB db.
+
+### `delete.py` (609 lines) — `ovnctl delete` (alias `teardown`)
+
+Port of `ovndelete.sh`. Reverses the OVN/OVS config so you can start from
+scratch.
+
+Everything is **discovered dynamically** rather than matched against
+hardcoded names, so it works regardless of what names were used to create
+the switches, routers, ports and bridges. Only `br-int` gets special
+handling, since it is OVN's own integration bridge rather than an uplink
+bridge to remove outright.
+
+Steps:
+
+1. `host-networking` — flush addresses/routes on br-int internal ports
+2. `ovs-ports` — remove those OVS ports
+3. `uplink-bridges` — remove every other OVS bridge and free its NIC (and
+   re-manage that NIC in NetworkManager)
+4. `logical-config` — remove all logical routers and switches
+5. `port-groups` — remove all port groups and their ACLs
+6. `lb-meters` — remove load balancers and meters
+7. `stop-pcap` — stop captures and remove mirrors
+8. `stop-controller` — stop ovn-controller
+9. `chassis` — remove `Chassis` / `Chassis_Private` rows
+10. `external-ids` — clear the OVS external-ids
+11. `purge-db` — *(`--purge-db` only)* wipe the raw NB/SB database files
+12. `br-int` — remove br-int and verify it stays gone
+13. `verify-clean` — confirm the SB db is empty
+14. `tracker` — erase the deployment tracker
+15. `show` — *(`-v`)* dump `ovs-vsctl` / `ovn-nbctl show`
+
+`--purge-db` is belt-and-braces on top of the object-level wipe, which
+already removes everything logically. `--keep-br-int` leaves br-int in
+place. `stop_controller_hard()` exists because a controller that
+re-registers as fast as rows are deleted defeats the chassis step.
+
+### `deploy.py` (200 lines) — `ovnctl deploy`
+
+Port of `ovn-deploy.sh`. Runs the deployment in order.
+
+Each stage **is** the corresponding subcommand, re-entered in-process via
+`cli.run_argv` with the same global flags, so `ovnctl deploy --from acl`
+and `ovnctl acl` do exactly the same work.
+
+| stage | kind |
+|---|---|
+| `setup` | required |
+| `localnet-internal` | required |
+| `localnet-external` | required |
+| `vm-config` | required |
+| `vm-isolation` | required |
+| `acl` | required |
+| `vm-attach` | optional |
+| `pcap --start` | optional |
+
+Required stages abort the run if they fail. Optional stages report and
+continue — they depend on things outside OVN (libvirt, tcpdump, running
+VMs) and are expected to no-op on some hosts, so a missing host-side tool
+must not silently swallow everything after it.
+
+Because it uses the same step framework, `--from vm-config` resumes a
+half-finished build and `--skip pcap` drops a stage. `--verify` runs
+`diagnose` once the deployment finishes.
+
+### `runbook.py` (244 lines) — `ovnctl runbook`
+
+Port of `ovn-runbook.sh`. Emits every command the automation would run as a
+single clean, copy-pasteable shell script.
+
+Distinct from both `--dry-run` on one subcommand (a single component) and
+`ovnctl -n deploy` (chained, with banners): this produces a self-contained
+runbook you can hand to someone without the tooling, paste into a change
+record, or diff between two configurations.
+
+It works by capturing each subcommand's dry-run output in-process
+(`contextlib.redirect_stdout` around `cli.run_argv`) and wrapping it in
+section headers with a generated preamble (hostname, chassis id,
+timestamp).
+
+Flags: `-o FILE`, `--teardown`, `--all` (deployment then teardown),
+`--no-header` (commands only, no comments).
+
+**Important caveat, stated in the module docstring and the README:** the
+output reflects the *current* state of the system, because every subcommand
+queries before deciding what to change. On a fully deployed host you get
+only the delta. For the full build sequence, generate it from a clean host
+or after a teardown.
+
+### `show.py` (832 lines) — `ovnctl show`
+
+Port of the standalone `tools/ovn-show`. Cisco-style read-only views.
+
+| view | shows |
+|---|---|
+| `chassis` | SB registration, gateway pins, `cr-` bindings |
+| `routers` | logical routers and their ports |
+| `switches` | logical switches and their ports |
+| `ip-int-br` | router ports and addresses |
+| `interfaces` | switch ports and attached VIFs |
+| `route` | the logical routing table |
+| `policies` | logical router policies (reroute rules) |
+| `acls` | switch-level **and** port-group ACLs |
+
+No argument prints everything. `_ALIASES` accepts the singular/plural and
+`show-`-prefixed spellings.
+
+Nothing here mutates anything, so it does not honour `--dry-run`. The
+original shipped with `shell=True` string commands; this runs everything as
+argv lists instead, for the same output.
+
+The bulk of the file is OVSDB JSON normalisation (`extract_ovsdb_ports`,
+`parse_ovsdb_map`, `parse_ovsdb_bool`, `extract_ovsdb_set`,
+`extract_ovsdb_scalar`, `_uuid_of`) plus a set of `get_*_map()` correlators.
+
+Three details:
+
+- `get_port_binding_map()` returns `None` — not `{}` — if the SB db could
+  not be queried at all, so callers can distinguish "SB unreachable" from
+  "port genuinely unbound". Conflating those turns every port into a false
+  DOWN when the tool is run without root.
+- `get_acl_details_map()` tries the query *with* the `name` column first
+  and falls back to one without it, since `name` is a newer addition and
+  older deployments would otherwise return nothing at all.
+- `_vm_domain()` resolves a port to a VM by consulting virsh first (the
+  actual running domain) and falling back to the `external-ids:vm-name` tag
+  `vm-config` sets — which still resolves when the libvirt domain doesn't
+  exist or isn't running. All three views use the same correlator; the
+  port-group view previously read the tag only, so the same port appeared
+  as two different machines depending on which section you looked at.
+
+`show_chassis()` additionally warns when multiple chassis are registered on
+a single-node deployment (likely system-id drift) or when the local
+`system-id` matches no registered chassis at all.
+
+---
+
+## 5. Cross-cutting behaviour
+
+### The step model
+
+Every command declares its steps by name:
+
+```
+$ ./ovnctl localnet-internal --list-steps
+Available steps for localnet-internal (in run order):
+   1. check-router    verify lr-core exists
+   2. bridge-nic      create br-internal and enslave the NIC
+   ...
+```
+
+| flag | effect |
+|---|---|
+| `--list-steps` | list and exit |
+| `--only A,B` | run just those |
+| `--skip A,B` | run everything else |
+| `--from A` | start at A, continue to the end |
+
+`--list-steps` deliberately needs neither root nor a working OVN install.
+
+### Deployment tracker keys
+
+`setup`, `localnet-internal`, `localnet-external`, `vm-config`,
+`vm-isolation`, `acls`. Written by each command on success, cleared per
+component by `--remove`, truncated entirely by `delete`. Read by
+`diagnose` to gate its checks and by `reconcile` to restamp the boot id.
+
+### Global flags
+
+`-v/--verbose`, `-n/--dry-run`, `--config PATH`, `--state-file PATH`,
+`--no-color`. Accepted before or after the subcommand.
+
+### Exit codes
+
+`0` success · `1` failure (including `diagnose` finding problems) ·
+`2` usage error · `130` interrupted.
+
+---
+
+## 6. Behavioural fixes carried in the port
+
+The shell suite had drifted out of sync with its own configuration and did
+not run on a clean checkout. These differences are deliberate.
+
+**`localnet-external` and `diagnose` aborted immediately.** Both called
+`require_cfg` for a `[localnet_external]` block and an `[asa_addressing]`
+section that no longer exist. Policy-only is now the primary path; the
+legacy physical-uplink steps run only when those keys are actually present,
+so both topologies work.
+
+**`diagnose` had three latent faults** — an undefined `_iso_vms` breaking
+the live isolation proof, three `cfg` calls passing a default to a
+two-argument function that exits on a miss, and the abort above meaning a
+single-NIC host could not be diagnosed at all.
+
+**`next_hop` validation was documented but never implemented.** Now an
+error when set explicitly and off-link, a warning when inherited from
+`lan_gateway`.
+
+**`--dry-run` wrote to the deployment tracker.** Previewing `ovn-setup.sh`
+left a `setup` flag behind and every later diagnose believed the deployment
+existed. Tracker writes are now no-ops in a dry run.
+
+**A partial run no longer claims a full deployment.** Recording `setup`
+after `--only switches` made diagnose expect a router, gateway ports and a
+host interface that were never created.
+
+**`ovn-internal-ranges.conf` is parsed, not sourced.** The shell `source`d
+it, so a stray command in a config file would execute.
+
+**`unit_exists` no longer uses `systemctl … | grep -q`.** grep exits on
+first match, systemctl takes SIGPIPE, and the pipeline reports failure
+despite having matched.
+
+Two behaviours preserved on purpose, both verified by `diagnose`:
+
+- Port-group ACL matches are always scoped with `inport`/`outport ==
+  @<group>`. An unscoped match applies switch-wide — this caused a real
+  outage once.
+- `ovn-trace` verdicts match `ct_mark.blocked = 1` as well as `drop;`.
+  Once any ACL is `allow-related` the pipeline is stateful and northd
+  compiles a drop into a `ct_commit` with no `output`, so matching only
+  `drop;` reports stateful drops as ALLOW.
