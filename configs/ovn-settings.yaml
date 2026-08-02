@@ -78,6 +78,24 @@ setup:
     - "172.31.1.32/28"
     - "172.31.0.0/27"
 
+  # Metric for the routes above, on BOTH paths that install them: the
+  # NetworkManager profile written by `--install-nm-profile` and the
+  # `ip route replace` that setup and reconcile run.
+  #
+  # This is not cosmetic. `ip route replace` matches on (destination,
+  # metric), so the two paths only agree that they are talking about the
+  # same route if they use the same number. Left unset, NetworkManager
+  # picks 550 for an OVS internal port -- its fallback for a device type
+  # it does not recognise as ethernet -- while the kernel gives an
+  # unqualified `ip route` metric 0, and every prefix ends up installed
+  # twice, once by each owner, with reconcile unable to see or replace
+  # NM's copy.
+  #
+  # Set it whenever the NetworkManager profile is in use. Any value works
+  # as long as it is the same on both sides; 100 matches the usual metric
+  # of a NM-managed ethernet uplink.
+  host_route_metric: 100
+
   # Legacy single-route fields, still honoured if host_routes is absent.
   remote_subnet: 172.31.1.32/28
   remote_gw: 172.31.1.10

@@ -587,6 +587,28 @@ class Diagnose:
             if tap:
                 self.bad(f"VIF '{lp}' is plugged into local OVS (interface: {tap}) "
                          "but has NO chassis bound.")
+                # Before blaming the race: does the interface even have a
+                # datapath port? ovn-controller cannot claim a port with
+                # ofport -1, and no number of restarts will change that.
+                # Sending the operator to `reconcile` here is worse than
+                # saying nothing -- it looks like a fix, does nothing, and
+                # hides the real cause behind a plausible one.
+                ofport, iface_error = ovn.iface_health(ctx, tap)
+                if ofport <= 0:
+                    self.detail(
+                        f"Interface '{tap}' has no datapath port (ofport {ofport}),",
+                        "so there is nothing for ovn-controller to claim. This is",
+                        "NOT the reboot race and a controller restart will not fix",
+                        "it -- the OVS port itself has to be rebuilt.")
+                    if iface_error:
+                        self.detail(f"ovs-vswitchd: {iface_error}")
+                    kind = self._link_kind(tap)
+                    if kind and kind != "openvswitch":
+                        self.detail(
+                            f"A {kind} device is holding the name '{tap}'.")
+                    self.detail("-> ovnctl setup --only host-interface")
+                    problems += 1
+                    continue
                 # The fix depends entirely on section 4. Restarting the
                 # controller is the right move for a plain reboot race and
                 # the wrong one when the identity has drifted, where it
@@ -1232,6 +1254,26 @@ class Diagnose:
     # ------------------------------------------------------------------
     # 7
     # ------------------------------------------------------------------
+    def _link_kind(self, name: str) -> str:
+        """The kernel's device kind for `name` ('' if it does not exist).
+
+        `ip -d link show` names it on the third line: 'openvswitch' for a
+        real OVS internal port, 'dummy' for a placeholder left behind by
+        something else. Device names are a single global namespace, so a
+        non-OVS device wearing this name is the reason ovs-vswitchd could
+        not create its own.
+        """
+        res = self.ctx.q("ip", "-d", "link", "show", "dev", name)
+        if not res.ok:
+            return ""
+        known = ("openvswitch", "dummy", "veth", "bridge", "bond", "vlan",
+                 "tun", "vxlan", "macvlan", "team", "geneve")
+        for line in res.stdout.splitlines()[1:]:
+            for token in line.split():
+                if token in known:
+                    return token
+        return "unknown"
+
     def check_host_if(self) -> None:
         ctx = self.ctx
         self.section(f"7. {self.host_if} OVS interface")
@@ -1250,6 +1292,39 @@ class Diagnose:
         else:
             self.bad(f"iface-id is '{iface_id}', expected '{self.host_if}'.")
         self.detail(f"admin_state={admin} link_state={link}")
+
+        # ofport before anything else. Every other field in this row can be
+        # exactly right while ovs-vswitchd has failed to open the netdev
+        # behind it -- the classic cause being another device that already
+        # owns the name, which makes add-port fail with "File exists" and
+        # leaves the row with ofport -1. In that state admin_state and
+        # link_state read as the empty set rather than "down", which is
+        # easy to skim past, so the line above says [] and everything looks
+        # fine. It is not fine: no ofport means ovn-controller has nothing
+        # to bind, which is what section 5 is reporting.
+        ofport, iface_error = ovn.iface_health(ctx, self.host_if)
+        if ofport <= 0:
+            self.bad(f"{self.host_if} has no datapath port (ofport {ofport}).")
+            self.host_if_down = True
+            if iface_error:
+                self.detail(f"ovs-vswitchd: {iface_error}")
+            kind = self._link_kind(self.host_if)
+            if kind and kind != "openvswitch":
+                self.detail(
+                    f"A {kind} device is holding the name '{self.host_if}',",
+                    "so ovs-vswitchd cannot create its internal port. Whatever",
+                    "creates that device -- usually a NetworkManager profile of",
+                    "that type -- will recreate it at every boot.",
+                    f"-> nmcli -f NAME,TYPE,DEVICE connection show | grep {self.host_if}",
+                    "-> ovnctl setup --only host-interface   (removes it and rebuilds)")
+            else:
+                self.detail(
+                    "The port row is present but nothing is behind it. Restarting",
+                    "ovn-controller will not help; the port has to be rebuilt.",
+                    "-> ovnctl setup --only host-interface")
+            return
+
+        self.ok(f"{self.host_if} has a datapath port (ofport {ofport}).")
 
         # An internal port on br-int comes back after a reboot with the
         # port and its iface-id intact and the kernel side blank: down, no
