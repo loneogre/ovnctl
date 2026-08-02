@@ -557,11 +557,19 @@ class Pcap:
     def do_start(self) -> int:
         ctx = self.ctx
         if not self.enabled:
-            raise Abort(
-                "pcap.enabled is false in ovn-settings.yaml -- refusing to start.\n"
-                "Set it to true, or this would capture without it being recorded "
-                "in config."
-            )
+            # Not an error. `pcap.enabled: false` is a decision someone
+            # made in the config, and --start against it is a no-op that
+            # was correctly refused, not a failure of anything. Aborting
+            # made `deploy` report a skipped stage and a warning on every
+            # single run of a host that has simply chosen not to capture,
+            # which is exactly the kind of permanent expected noise that
+            # teaches people to stop reading the output.
+            ctx.log("pcap.enabled is false in ovn-settings.yaml -- nothing to "
+                    "start.")
+            ctx.log("Set [pcap].enabled to true to capture; leaving it false "
+                    "keeps this a no-op so that a capture can never begin "
+                    "without being recorded in config.")
+            return 0
         ctx.require_cmd("tcpdump")
 
         if not ovn.br_exists(ctx, self.br_int) and not ctx.dry_run:

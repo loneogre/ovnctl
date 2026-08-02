@@ -103,6 +103,7 @@ class Teardown:
         for iface in ifaces:
             ctx.log(f"Cleaning up kernel networking for {iface}...")
             if ctx.q("ip", "link", "show", iface).ok:
+                self._nm_release(iface)
                 ctx.run("ip", "route", "flush", "dev", iface)
                 ctx.run("ip", "addr", "flush", "dev", iface)
                 ctx.run("ip", "link", "set", iface, "down")
@@ -111,6 +112,34 @@ class Teardown:
             else:
                 ctx.log(f"{iface} has no kernel link, skipping ip cleanup.")
         self.report("Host networking:", f"{flushed} interface(s) flushed")
+
+    def _nm_release(self, iface: str) -> None:
+        """Deactivate any NetworkManager profile holding this interface.
+
+        Without this the flush below is cosmetic: NetworkManager owns the
+        address and routes on host-if once `reconcile --install-nm-profile`
+        has run, sees them disappear, and puts them straight back. The
+        teardown then reports the interface flushed while the host is
+        still carrying 172.31.x and routing into an OVN topology that no
+        longer exists -- the worst of both, because it looks finished.
+
+        The profile itself is deliberately left on disk. It is generated
+        from ovn-settings.yaml and costs nothing while the device is gone;
+        deleting it would mean the next deploy needs
+        `reconcile --install-nm-profile` again to become reboot-safe, and
+        forgetting that is how the interface ends up unconfigured after a
+        reboot.
+        """
+        ctx = self.ctx
+        if not ctx.have("nmcli"):
+            return
+        active = ctx.qout("nmcli", "-g", "GENERAL.CONNECTION", "device",
+                          "show", iface).strip()
+        if not active or active == "--":
+            return
+        ctx.log(f"NetworkManager profile '{active}' is active on {iface}; "
+                "deactivating it so the flush is not immediately undone.")
+        ctx.run("nmcli", "device", "disconnect", iface)
 
     # -- 2 ---------------------------------------------------------------
     def ovs_ports(self) -> None:
