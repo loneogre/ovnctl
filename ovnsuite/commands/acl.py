@@ -314,7 +314,7 @@ class ACLManager:
             return
 
         conf = RSYSLOG_CONF.format(target=target)
-        path = "/etc/rsyslog.d/10-ovn-acl.conf"
+        path = "/etc/rsyslog.d/11-ovn-acl.conf"
         if ctx.dry_run:
             print(f"cat > {path} <<'EOF'")
             print(conf, end="")
