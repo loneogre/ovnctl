@@ -575,6 +575,18 @@ def show_topology() -> None:
             return ""
         return f"   {DIM}(not in NB db){RST}"
 
+    def stem(colour: str) -> None:
+        """One connector row between two stacked boxes.
+
+        Column 38 is the centre of the upper stack. Every junction in the
+        drawing gets exactly one of these -- including the segment boxes
+        further down, which sit a row apart for the same reason. A stack
+        where some joins are tighter than others reads as though the
+        tight ones are more closely related, which is not what the
+        spacing is meant to say.
+        """
+        art.add(" " * 38, art.cell("│", colour))
+
     # --- the world outside OVN ---------------------------------------
     top = art.cell("┌" + "─" * _BOX + "┐", OUT)
     art.add("   ", top, "      ", top, "      ", top)
@@ -595,7 +607,7 @@ def show_topology() -> None:
     art.add("   ", art.cell("└" + "─" * _BOX + "┘", OUT), "      ",
             art.cell("└────────┬─────────┘", OUT), "      ",
             art.cell("└" + "─" * _BOX + "┘", OUT))
-    art.add(" " * 38, art.cell("│", OUT))
+    stem(OUT)
 
     # --- the single physical uplink ----------------------------------
     art.add(" " * 29, art.cell("┌────────┴─────────┐", OUT))
@@ -603,6 +615,7 @@ def show_topology() -> None:
             art.cell(br_internal, OUT, _BOX), art.cell("│", OUT),
             f"   {DIM}{phys_nic} · {physnet}{RST}")
     art.add(" " * 29, art.cell("└────────┬─────────┘", OUT))
+    stem(LOG)
     art.add(" " * 29, art.cell("┌────────┴─────────┐", LOG))
     art.add(" " * 29, art.cell("│", LOG),
             art.cell(ls_uplink, LOG, _BOX), art.cell("│", LOG),
@@ -610,6 +623,7 @@ def show_topology() -> None:
     art.add(" " * 29, art.cell("│", LOG),
             art.cell(transit_net, LOG, _BOX), art.cell("│", LOG))
     art.add(" " * 29, art.cell("└────────┬─────────┘", LOG))
+    stem(LOG)
 
     # --- the router ---------------------------------------------------
     bar = _ART_W - 3            # 72 columns of bar
