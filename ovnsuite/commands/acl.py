@@ -35,11 +35,11 @@ import re
 from dataclasses import dataclass
 
 from .. import ovn
-from ..context import Abort, Ctx, trace_verdict
+from ..context import Abort, Ctx, trace_acl_priorities, trace_verdict
 from ..inventory import Inventory
 from ..state import ACLS, Tracker, record
 from ..steps import StepRunner, add_step_args
-from .acl_audit import ACLAudit
+from .acl_audit import ACLAudit, _norm
 
 NAME = "acl"
 HELP = "declarative micro-segmentation ACLs"
@@ -92,11 +92,14 @@ def register(subparsers) -> argparse.ArgumentParser:
     g.add_argument("--remove", action="store_true",
                    help="remove the groups and their ACLs")
     g.add_argument("--verify", action="store_true",
-                   help="ovn-trace the key allow/deny cases")
+                   help="ovn-trace every configured rule, plus verify_pairs")
     g.add_argument("--list", dest="do_list", action="store_true",
                    help="show what is currently applied")
     g.add_argument("--audit", action="store_true",
                    help="test every rule in the yaml against what is deployed")
+    p.add_argument("--quick", action="store_true",
+                   help="with --verify: one probe per rule instead of one "
+                        "per port (a 7-port set is 7 traces)")
     add_step_args(p)
     p.set_defaults(func=main)
     return p
@@ -137,6 +140,13 @@ class ACLManager:
 
         self.inv = Inventory(c, self.ls_int, self.ls_ext)
         self.created: list[str] = []
+
+        # --verify tallies. They live on the manager rather than in
+        # do_verify's locals so the per-rule reporter can count without
+        # threading a result object through every helper.
+        self.v_ok = self.v_fail = self.v_warn = self.v_shadow = 0
+        self.v_skip = 0
+        self.quick_verify = False
 
     @staticmethod
     def _split2(entry: str) -> tuple[str, str]:
@@ -535,6 +545,511 @@ class ACLManager:
         ctx.log("Done. VM-to-VM traffic is unrestricted again.")
 
     # ------------------------------------------------------------------
+    # generated coverage
+    # ------------------------------------------------------------------
+    # Every rule in [acls].rules becomes its own set of traces, built from
+    # the rule's own fields. verify_pairs still exists and is still run,
+    # but it is a hand-maintained list: it says nothing when a rule is
+    # added and nothing when one is edited, so on its own it can only ever
+    # prove that yesterday's policy still works.
+    #
+    # --audit already answers "is this rule in the db, byte for byte".
+    # This answers the different question of whether it DOES anything: an
+    # ACL can be deployed exactly as written and still be dead, because a
+    # higher-priority rule matches the same packets first.
+
+    def _sample_ip(self, spec: str) -> str:
+        """One concrete address to trace from inside a CIDR or literal.
+
+        ovn-trace needs an address, not a prefix. A /32 is itself; anything
+        wider yields its first usable host, which for the /30s in this
+        topology is the useful end of the link rather than the network
+        address.
+        """
+        import ipaddress
+        spec = spec.strip()
+        if not spec:
+            return ""
+        try:
+            net = ipaddress.ip_network(spec, strict=False)
+        except ValueError:
+            return ""
+        if net.prefixlen >= 31:
+            return str(net.network_address)
+        return str(next(net.hosts(), net.network_address))
+
+    def _spec_of(self, rule: ParsedRule, prefix: str) -> str:
+        for spec in rule.specs:
+            if spec.startswith(prefix):
+                return spec[len(prefix):]
+        return ""
+
+    def _group_members(self, group: str) -> list:
+        for name, selector in self.group_defs:
+            if name == group:
+                try:
+                    return self.inv.select(selector)
+                except Abort:
+                    return []
+        return []
+
+    def _rule_probes(self, rule: ParsedRule) -> tuple[list[tuple], str]:
+        """(probes, skip_reason) for one rule.
+
+        A probe is (label, peer_ip, proto_expr, local_vm). The rule's own
+        group supplies the local end; src=/dst= supplies the far end. For
+        a to-lport rule the group is the DESTINATION -- that is what
+        `outport == @group` means -- and the packet therefore arrives at
+        the switch already routed, which changes both the inport and the
+        TTL. Getting that backwards produces a trace that fails for
+        reasons that have nothing to do with the rule.
+        """
+        members = self._group_members(rule.group)
+        if not members:
+            return [], f"port group {rule.group} resolves to no VMs"
+
+        inbound = rule.direction == "to-lport"
+        local = members[0]
+        far_spec = self._spec_of(rule, "src=" if inbound else "dst=")
+        far_spec = self.expand_cidrs(far_spec) if far_spec else ""
+
+        if not far_spec or far_spec == "any":
+            # An unconstrained end means the rule is about lateral traffic
+            # between group members. Trace member -> member, which is the
+            # case these rules exist to catch; with only one member there
+            # is no such packet and the rule cannot be exercised.
+            peer = next((v for v in members if v.ip != local.ip), None)
+            if peer is None:
+                return [], f"{rule.group} has one member -- no lateral peer"
+            peers = [peer.ip]
+        else:
+            known = {vm.ip: vm for vm in self.inv.all if vm.ip}
+            peers = self._addr_samples(far_spec, known, local.ip)
+            if not peers:
+                return [], f"could not derive an address from '{far_spec}'"
+
+        protos: list[tuple[str, str]] = []
+        tcp = self._spec_of(rule, "tcp=")
+        udp = self._spec_of(rule, "udp=")
+        if tcp:
+            protos += [(f"tcp/{p}", f"tcp && tcp.dst=={p}")
+                       for p in self.expand_ports(tcp).split(",") if p]
+        if udp:
+            protos += [(f"udp/{p}", f"udp && udp.dst=={p}")
+                       for p in self.expand_ports(udp).split(",") if p]
+        if "icmp" in rule.specs:
+            protos.append(("icmp", "icmp4"))
+        if not protos:
+            protos = [("ip", "")]
+        if self.quick_verify:
+            protos = protos[:1]
+
+        probes = []
+        for peer_ip in peers:
+            for plabel, pexpr in protos:
+                probes.append((plabel, peer_ip, pexpr, local))
+        return probes, ""
+
+    @staticmethod
+    def _fld(rec, field: str) -> str:
+        """One accessor for both an inventory VM and a db port record."""
+        return rec[field] if isinstance(rec, dict) else getattr(rec, field)
+
+    def _trace_expr(self, direction: str, local, peer_ip: str, proto: str,
+                    by_ip: dict, lrp_mac: dict):
+        """(datapath, expr) for one probe.
+
+        Both passes come through here. If they built expressions
+        separately, a rule could be traced one way when it comes from the
+        yaml and another way when it comes from the db, and the two
+        results would disagree for reasons that have nothing to do with
+        the policy.
+
+        The direction is what decides the shape. `to-lport` means
+        `outport == @group`, so the group is the DESTINATION: the packet
+        has already been routed, which puts it on the switch's router port
+        with a decremented TTL. Getting that backwards produces a trace
+        that fails for reasons unrelated to the rule under test.
+        """
+        f = self._fld
+        switch = f(local, "switch")
+        peer = by_ip.get(peer_ip)
+        gw_mac = lrp_mac.get(switch, "")
+
+        if direction == "to-lport":
+            datapath = switch
+            if peer is not None and f(peer, "switch") == switch:
+                inport, src_mac, ttl = (f(peer, "uuid"), f(peer, "mac"), 64)
+            else:
+                inport, src_mac, ttl = f"{switch}-to-lr", gw_mac, 63
+            eth_dst, src_ip, dst_ip = f(local, "mac"), peer_ip, f(local, "ip")
+        else:
+            datapath = switch
+            inport, src_mac, ttl = f(local, "uuid"), f(local, "mac"), 64
+            eth_dst = (f(peer, "mac") if peer is not None
+                       and f(peer, "switch") == switch else gw_mac)
+            src_ip, dst_ip = f(local, "ip"), peer_ip
+
+        expr = (f'inport=="{inport}" && eth.src=={src_mac} && '
+                f'eth.dst=={eth_dst} && ip4.src=={src_ip} && '
+                f'ip4.dst=={dst_ip} && ip.ttl=={ttl}')
+        if proto:
+            expr += f" && {proto}"
+        return datapath, expr
+
+    # ------------------------------------------------------------------
+    # deployed-ACL coverage
+    # ------------------------------------------------------------------
+    # [acls].rules is not the whole policy. `user-vm` installs the two
+    # segment drops and a per-slot access rule itself, `vm-isolation`
+    # owns pg_isolated, and anything added by hand is real policy too.
+    # Enumerating only the yaml therefore verifies the part of the
+    # firewall that was easiest to verify, which is the wrong part.
+    #
+    # So the second pass reads the db, skips whatever the first pass
+    # already covered, and probes the rest. Slot rules are generated at
+    # create time and cannot be listed from any config file -- the db is
+    # the only place they exist.
+
+    _M_SCOPE = re.compile(r'(inport|outport)\s*==\s*(?:@(\S+)|"([^"]+)")')
+    _M_ADDR = re.compile(r'ip4\.(src|dst)\s*==\s*(\{[^}]*\}|[^\s&]+)')
+    _M_L4 = re.compile(r'(tcp|udp)\.dst\s*==\s*(\{[^}]*\}|\d+)')
+
+    @staticmethod
+    def _ovsdb_set(value) -> list[str]:
+        """Scalars out of an ovsdb column that may or may not be a set."""
+        if isinstance(value, str):
+            return [value] if value and value != "uuid" else []
+        if isinstance(value, list):
+            if len(value) == 2 and value[0] in ("set", "map"):
+                out: list[str] = []
+                for item in value[1]:
+                    out.extend(ACLManager._ovsdb_set(item))
+                return out
+            if len(value) == 2 and value[0] == "uuid":
+                return [value[1]]
+            out = []
+            for item in value:
+                out.extend(ACLManager._ovsdb_set(item))
+            return out
+        return []
+
+    def _db_ports(self) -> tuple[dict, dict]:
+        """(port table, ip index) covering every logical switch port.
+
+        Built from the db rather than from Inventory because Inventory is
+        constructed over the internal and external switches only -- it has
+        never heard of a user-VM slot, so a probe for one cannot be
+        assembled from it at all.
+        """
+        ctx = self.ctx
+        parent: dict[str, str] = {}
+        for row in ovn.nb_json(ctx, "name,ports", "Logical_Switch"):
+            if not row or not row[0]:
+                continue
+            for uuid in self._ovsdb_set(row[1]):
+                parent[uuid] = row[0]
+
+        table: dict[str, dict] = {}
+        by_ip: dict[str, dict] = {}
+        for row in ovn.nb_json(ctx, "_uuid,name,type,addresses",
+                               "Logical_Switch_Port"):
+            if not row:
+                continue
+            uuid = self._ovsdb_set(row[0])
+            uuid = uuid[0] if uuid else ""
+            name, ptype = row[1], (row[2] or "vif")
+            if ptype not in ("", "vif"):
+                continue
+            addrs = " ".join(self._ovsdb_set(row[3])).split()
+            mac = next((a for a in addrs if a.count(":") == 5), "")
+            ip = next((a for a in addrs if a.count(".") == 3), "")
+            rec = {"name": name, "uuid": name, "mac": mac, "ip": ip,
+                   "switch": parent.get(uuid, "")}
+            table[name] = rec
+            if uuid:
+                table[uuid] = rec
+            if ip:
+                by_ip[ip] = rec
+        return table, by_ip
+
+    def _switch_lrp_mac(self) -> dict[str, str]:
+        """Logical switch -> the MAC of the router port it is attached to.
+
+        _trace_expr used to pick between the internal and external LRP
+        MACs, which is right for exactly the two switches this file knows
+        about and wrong for the user-VM segment. Ask the db instead.
+        """
+        ctx = self.ctx
+        lrp_mac: dict[str, str] = {}
+        for row in ovn.nb_json(ctx, "name,mac", "Logical_Router_Port"):
+            if row and row[0]:
+                macs = self._ovsdb_set(row[1])
+                lrp_mac[row[0]] = macs[0] if macs else ""
+
+        parent: dict[str, str] = {}
+        for row in ovn.nb_json(ctx, "name,ports", "Logical_Switch"):
+            if not row or not row[0]:
+                continue
+            for uuid in self._ovsdb_set(row[1]):
+                parent[uuid] = row[0]
+
+        out: dict[str, str] = {}
+        for row in ovn.nb_json(ctx, "_uuid,name,type,options",
+                               "Logical_Switch_Port"):
+            if not row or (row[2] or "") != "router":
+                continue
+            uuid = self._ovsdb_set(row[0])
+            switch = parent.get(uuid[0] if uuid else "", "")
+            target = dict(ovn._json_map(row[3])).get("router-port", "")
+            if switch and target in lrp_mac:
+                out[switch] = lrp_mac[target]
+        return out
+
+    def _members_of(self, group: str) -> list[str]:
+        for row in ovn.nb_json(self.ctx, "name,ports", "Port_Group"):
+            if row and row[0] == group:
+                return self._ovsdb_set(row[1])
+        return []
+
+    def _addr_samples(self, blob: str, known: dict | None = None,
+                      exclude: str = "") -> list[str]:
+        """Sample addresses out of an `ip4.src == {a, b, c}` operand.
+
+        A range that actually contains a port is probed AT that port
+        rather than at its first host. It matters most for the user-VM
+        self-block: the segment lists its own subnet, whose first host is
+        the router, so sampling naively would trace slot -> gateway and
+        never test the slot -> slot case the rule exists to stop.
+        """
+        import ipaddress
+        out: list[str] = []
+        for part in blob.strip().strip("{}").replace(",", " ").split():
+            pick = ""
+            if known:
+                try:
+                    net = ipaddress.ip_network(part, strict=False)
+                except ValueError:
+                    net = None
+                if net is not None:
+                    for addr in known:
+                        if addr == exclude:
+                            continue
+                        try:
+                            if ipaddress.ip_address(addr) in net:
+                                pick = addr
+                                break
+                        except ValueError:
+                            continue
+            pick = pick or self._sample_ip(part)
+            if pick:
+                out.append(pick)
+        return out
+
+    def _db_acl_probes(self, direction: str, match: str,
+                       ports: dict, by_ip: dict) -> tuple[list[tuple], str]:
+        scope = self._M_SCOPE.search(match)
+        if not scope:
+            return [], "match names no inport/outport"
+        group, explicit = scope.group(2), scope.group(3)
+
+        if explicit:
+            local = ports.get(explicit)
+            if local is None:
+                return [], f"port {explicit[:12]}... is not a VIF in the db"
+            locals_ = [local]
+        else:
+            members = [ports[m] for m in self._members_of(group) if m in ports]
+            if not members:
+                return [], f"port group {group} has no VIF members"
+            locals_ = members[:1]
+
+        inbound = direction == "to-lport"
+        far_side = "src" if inbound else "dst"
+        addrs = {side: blob for side, blob in self._M_ADDR.findall(match)}
+        if far_side in addrs:
+            peers = self._addr_samples(addrs[far_side], by_ip,
+                                       locals_[0]["ip"])
+            if not peers:
+                return [], f"no usable address in ip4.{far_side}"
+        else:
+            peer = next((m for m in
+                         ([ports[x] for x in self._members_of(group)
+                           if x in ports] if group else [])
+                        if m["ip"] and m["ip"] != locals_[0]["ip"]), None)
+            if peer is None:
+                return [], "unconstrained match with no peer to trace from"
+            peers = [peer["ip"]]
+
+        protos: list[tuple[str, str]] = []
+        for proto, blob in self._M_L4.findall(match):
+            for port in blob.strip().strip("{}").replace(",", " ").split():
+                protos.append((f"{proto}/{port}",
+                               f"{proto} && {proto}.dst=={port}"))
+        if "icmp4" in match:
+            protos.append(("icmp", "icmp4"))
+        if not protos:
+            protos = [("ip", "")]
+        if self.quick_verify:
+            protos = protos[:1]
+
+        probes = []
+        for local in locals_:
+            for peer_ip in peers:
+                for plabel, pexpr in protos:
+                    probes.append((plabel, peer_ip, pexpr, local))
+        return probes, ""
+
+    def _verify_deployed_acls(self) -> None:
+        ctx = self.ctx
+        acls = ovn.nb_json(ctx, "_uuid,name,direction,priority,action,match",
+                           "ACL")
+        if not acls:
+            return
+
+        # Whatever the first pass already probed, by match. Rebuilt with
+        # build_match -- the same call the deployer makes -- so a rule
+        # cannot be counted as covered here and written differently there.
+        covered = set()
+        for rule in self.parsed_rules():
+            if rule.error:
+                continue
+            try:
+                covered.add(_norm(self.build_match(rule.direction, rule.group,
+                                                   rule.specs)))
+            except Abort:
+                continue
+
+        pending = [a for a in acls if _norm(a[5] or "") not in covered]
+        if not pending:
+            return
+
+        owner: dict[str, str] = {}
+        for row in ovn.nb_json(ctx, "name,acls", "Port_Group"):
+            if row and row[0]:
+                for uuid in self._ovsdb_set(row[1]):
+                    owner[uuid] = row[0]
+
+        print("  --- deployed ACLs not declared in [acls].rules ---")
+        ports, by_ip = self._db_ports()
+        lrp_mac = self._switch_lrp_mac()
+
+        for row in pending:
+            uuid = self._ovsdb_set(row[0])
+            uuid = uuid[0] if uuid else ""
+            name = " ".join(self._ovsdb_set(row[1])) or "(unnamed)"
+            direction, priority, action, match = row[2], str(row[3]), row[4], row[5]
+            group = owner.get(uuid, "?")
+            label = f"{name} [{group}] ({direction} {priority} {action})"
+
+            probes, skip = self._db_acl_probes(direction, match or "",
+                                               ports, by_ip)
+            if skip:
+                self.v_skip += 1
+                print(f"  [SKIP] {label:<46} {skip}")
+                continue
+
+            expect = "DROP" if action in ("drop", "reject") else "ALLOW"
+            want_prio = int(priority) if str(priority).isdigit() else -1
+            side = "out" if direction == "to-lport" else "in"
+            results = []
+            for plabel, peer_ip, pexpr, local in probes:
+                dp, expr = self._trace_expr(direction, local, peer_ip, pexpr,
+                                            by_ip, lrp_mac)
+                out = ovn.trace(ctx, dp, expr)
+                results.append((plabel, peer_ip, local, expect,
+                                trace_verdict(out),
+                                trace_acl_priorities(out, side), out))
+            self._report_case(label, want_prio, results)
+        print("")
+
+    def _verify_every_rule(self, lrp_int_mac: str, lrp_ext_mac: str) -> None:
+        rules = [r for r in self.parsed_rules() if not r.error]
+        if not rules:
+            print("  (no rules configured)")
+            return
+
+        print("  --- per-rule coverage (generated from [acls].rules) ---")
+        by_ip = {vm.ip: vm for vm in self.inv.all if vm.ip}
+        lrp_mac = dict(self._switch_lrp_mac())
+        lrp_mac.setdefault(self.ls_int, lrp_int_mac)
+        lrp_mac.setdefault(self.ls_ext, lrp_ext_mac)
+        for rule in rules:
+            probes, skip = self._rule_probes(rule)
+            if skip:
+                self.v_skip += 1
+                print(f"  [SKIP] {rule.name:<46} {skip}")
+                continue
+
+            expect = "DROP" if rule.action in ("drop", "reject") else "ALLOW"
+            want_prio = int(rule.priority) if rule.priority.isdigit() else -1
+            side = "out" if rule.direction == "to-lport" else "in"
+            results = []
+            for plabel, peer_ip, pexpr, local in probes:
+                datapath, expr = self._trace_expr(
+                    rule.direction, local, peer_ip, pexpr, by_ip, lrp_mac)
+                out = ovn.trace(self.ctx, datapath, expr)
+                results.append((plabel, peer_ip, local, expect,
+                                trace_verdict(out),
+                                trace_acl_priorities(out, side), out))
+            label = (f"{rule.name} ({rule.direction} {rule.priority} "
+                     f"{rule.action})")
+            self._report_case(label, want_prio, results)
+        print("")
+
+    def _report_case(self, label: str, want_prio: int,
+                     results: list) -> None:
+        """One line per rule when it is healthy, detail when it is not.
+
+        Collapsing the ports is deliberate. A rule with a seven-port set
+        produces seven traces, and printing seven OK lines for each of
+        eighteen rules buries the two that matter.
+        """
+        bad = []
+        shadowed = []
+        unmeasured = []
+        for plabel, peer_ip, local, expect, verdict, prios, out in results:
+            decided = [p for p in prios if p > 0]
+            if verdict == "UNKNOWN":
+                unmeasured.append((plabel, peer_ip, out))
+            elif want_prio >= 0 and decided and want_prio not in decided:
+                shadowed.append((plabel, peer_ip, decided[-1], verdict))
+            elif want_prio >= 0 and not decided and expect == "ALLOW":
+                # Allowed, but no ACL claimed it -- the packet fell through
+                # to OVN's default. The rule is a no-op as written.
+                shadowed.append((plabel, peer_ip, 0, verdict))
+            elif verdict != expect:
+                bad.append((plabel, peer_ip, verdict, expect, out))
+
+        n = len(results)
+        if bad:
+            self.v_fail += 1
+            print(f"  [FAIL] {label:<46} {len(bad)}/{n} probes wrong")
+            for plabel, peer_ip, verdict, expect, out in bad[:3]:
+                print(f"         {peer_ip} {plabel}: {verdict}, "
+                      f"expected {expect}")
+                for line in out.splitlines()[-4:]:
+                    print(f"           {line}")
+        elif unmeasured and len(unmeasured) == n:
+            self.v_warn += 1
+            print(f"  [WARN] {label:<46} no verdict (trace failed/timed out)")
+            for line in (unmeasured[0][2].splitlines()[-4:] or ["(no output)"]):
+                print(f"         {line}")
+        elif shadowed:
+            self.v_shadow += 1
+            first = shadowed[0]
+            where = (f"priority {first[2]}" if first[2]
+                     else "no ACL matched -- default allow")
+            print(f"  [DEAD] {label:<46} {len(shadowed)}/{n} decided by "
+                  f"{where}")
+            for plabel, peer_ip, prio, verdict in shadowed[:3]:
+                print(f"         {peer_ip} {plabel}: {verdict} from "
+                      + (f"priority {prio}" if prio else "the default flow"))
+        else:
+            self.v_ok += 1
+            print(f"  [ OK ] {label:<46} {n} probe(s)")
+
+    # ------------------------------------------------------------------
     # verify
     # ------------------------------------------------------------------
     def _check(self, label: str, expect: str, datapath: str, expr: str) -> None:
@@ -553,7 +1068,7 @@ class ACLManager:
             for line in out.splitlines()[-6:]:
                 print(f"         {line}")
 
-    def do_verify(self) -> None:
+    def do_verify(self) -> int:
         ctx = self.ctx
         ctx.require_cmd("ovn-trace")
 
@@ -614,6 +1129,8 @@ class ACLManager:
                     f'eth.dst=={v2.mac} && ip4.src=={v1.ip} && '
                     f'ip4.dst=={v2.ip} && ip.ttl==64 && tcp && tcp.dst==443')
 
+        self._verify_every_rule(lrp_int_mac, lrp_ext_mac)
+        self._verify_deployed_acls()
         self._verify_configured_pairs(lrp_int_mac, lrp_ext_mac)
 
         # Engagement traffic out must survive.
@@ -622,7 +1139,25 @@ class ACLManager:
                     f'inport=="{ev.uuid}" && eth.src=={ev.mac} && '
                     f'eth.dst=={lrp_ext_mac} && ip4.src=={ev.ip} && '
                     f'ip4.dst==203.0.113.10 && ip.ttl==64 && tcp && tcp.dst==22')
+
+        total = self.v_ok + self.v_fail + self.v_warn + self.v_shadow
+        print(f"  {total} rule(s) exercised: {self.v_ok} ok, "
+              f"{self.v_fail} failed, {self.v_shadow} dead/shadowed, "
+              f"{self.v_warn} unmeasured, {self.v_skip} skipped")
+        if self.v_fail or self.v_shadow:
+            print("  A DEAD rule is deployed correctly but never decides "
+                  "anything -- check for a")
+            print("  higher-priority rule matching the same packets, or "
+                  "raise this rule above it.")
         print("")
+
+        # DEAD does not fail the run. [acls] documents two rules as
+        # deliberate no-ops -- recorded intent for a policy that will be
+        # tightened later -- and a check that cannot tell an intentional
+        # no-op from an accidental one must not be the thing that blocks a
+        # deploy. It reports; you decide. A wrong VERDICT is different:
+        # the rule matched and did the opposite of what it says.
+        return 1 if self.v_fail else 0
 
     def _verify_configured_pairs(self, lrp_int_mac: str, lrp_ext_mac: str) -> None:
         """Declarative pairs from [acls].verify_pairs.
@@ -716,8 +1251,8 @@ def main(ctx: Ctx, args: argparse.Namespace) -> int:
         cmd.do_remove()
         return 0
     if args.verify:
-        cmd.do_verify()
-        return 0
+        cmd.quick_verify = bool(getattr(args, "quick", False))
+        return cmd.do_verify()
     if args.do_list:
         cmd.do_list()
         return 0

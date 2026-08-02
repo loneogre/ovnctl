@@ -402,3 +402,45 @@ def trace_verdict(output: str) -> str:
     if "ingress(dp=" not in output:
         return "UNKNOWN"
     return "ALLOW"
+
+
+# ovn-trace names the flow that matched at each stage, with its priority.
+# The stage is ls_in_acl for from-lport rules and ls_out_acl for to-lport
+# ones; OVN has spelled it ls_in_acl, ls_in_acl_eval and ls_in_acl_action
+# across versions, so match the stem with those suffixes -- but NOT
+# ls_in_acl_hint, which is conntrack bookkeeping at priority 5 and is not
+# anybody's rule.
+_ACL_STAGE = re.compile(
+    r"^\s*(?:\d+\.\s*)?ls_(?P<side>in|out)_acl(?:_eval|_action)?\s*\([^)]*\)\s*:"
+    r".*?,\s*priority\s+(?P<prio>\d+)", re.IGNORECASE)
+
+
+def trace_acl_priorities(output: str, side: str = "") -> list[int]:
+    """Priorities of the ACL-stage flows that matched, in pipeline order.
+
+    This is what turns a trace from "the packet was allowed" into "the
+    packet was allowed BY THIS RULE". The distinction matters more than it
+    sounds: with no default-deny, an allow rule and a missing allow rule
+    produce identical verdicts, so a verdict-only check passes whether or
+    not the rule exists. It also catches the opposite error -- a rule that
+    is present and correct but shadowed by a higher-priority one, which
+    reads as a pass on every check that only looks at the outcome.
+
+    Priority 0 is OVN's default no-match flow and is reported as such: it
+    means no ACL matched, not that a rule with priority 0 fired.
+
+    Returns [] when the output carries no stage lines at all (an older
+    ovn-trace, or a failed one). Callers must treat that as "could not
+    measure" rather than as "no rule matched" -- see trace_verdict, which
+    exists because that exact conflation used to be a bug here.
+    """
+    out: list[int] = []
+    want = (side or "").lower()
+    for line in output.splitlines():
+        m = _ACL_STAGE.match(line)
+        if not m:
+            continue
+        if want and m.group("side").lower() != want:
+            continue
+        out.append(int(m.group("prio")))
+    return out
