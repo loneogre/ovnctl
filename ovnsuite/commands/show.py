@@ -756,28 +756,32 @@ def show_topology() -> None:
         if kind == "world":
             left, right = _MARGIN, _MARGIN + bar - _CELL
             pad = " " * wgap
-            def broken(head_left: bool) -> str:
-                """A link drawn with a // break in it.
+            def broken() -> str:
+                """The workstation link, drawn with a // break in it.
 
                 The workstation LAN is not adjacent to the ASA -- there
                 are further hops in between that this picture does not
-                model, and an unbroken line says the opposite. The break
-                replaces two dashes rather than adding any, so the column
-                arithmetic is untouched and the ASCII fallback needs no
-                special case: `/` survives the translation as itself.
+                model, and an unbroken line says the opposite. Defended
+                terrain IS directly attached on the other side, so that
+                link stays solid; breaking both would make the mark mean
+                nothing.
+
+                The break replaces two dashes rather than adding any, so
+                the column arithmetic is untouched and the ASCII fallback
+                needs no special case: `/` survives the translation as
+                itself.
                 """
                 span = wgap - 1                 # dashes, minus the head
                 a = (span - 2) // 2
-                body = "─" * a + "//" + "─" * (span - 2 - a)
-                return ("◄" + body) if head_left else (body + "►")
+                return "\u25c4" + "\u2500" * a + "//" + "\u2500" * (span - 2 - a)
 
             art.add(" " * left, c_top(OUT, False), pad, c_top(OUT, False),
                     pad, c_top(OUT, False))
             art.add(" " * left, c_txt("workstation LAN", OUT),
-                    art.cell(broken(True), OUT),
+                    art.cell(broken(), OUT),
                     c_txt("ASA firewall", OUT),
-                    art.cell(broken(False), OUT),
-                    c_txt("client targets", OUT))
+                    art.cell("\u2500" * (wgap - 1) + "\u25ba", OUT),
+                    c_txt("defended terrain", OUT))
             art.add(" " * left, c_txt(ws_label or "outside OVN", OUT),
                     pad, c_txt(asa or "?", OUT),
                     pad, c_txt("via default route", OUT))
@@ -889,8 +893,8 @@ def show_topology() -> None:
     art.add(f"  {DIM}br-int is omitted: every VIF and host-if binds to it "
             f"locally, on every path shown.{RST}")
     if any(k == "world" for k, _c, _l in stack):
-        art.add(f"  {DIM}// marks a link with further hops that are outside "
-                f"OVN and not modelled here.{RST}")
+        art.add(f"  {DIM}// marks further hops outside OVN that are not "
+                f"modelled; defended terrain is directly attached.{RST}")
 
     # The user-VM segment is built on the first `user-vm --create`, not
     # by deploy, so its absence is a steady state rather than drift. A
