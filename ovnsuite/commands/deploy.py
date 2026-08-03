@@ -10,7 +10,9 @@ libvirt CLI, no tcpdump) cannot silently swallow everything after it.
     ovnctl deploy --list-steps       the stage list
     ovnctl deploy --from vm-config   resume a partial deployment
     ovnctl deploy --skip pcap        everything except the capture mirrors
-    ovnctl deploy --verify           run diagnose afterwards
+    ovnctl deploy                    deploy, then run diagnose
+    ovnctl deploy --verify           ... and fail if diagnose complains
+    ovnctl deploy --no-verify        skip the diagnose run
 
 Each stage is the corresponding subcommand, re-entered in-process with
 the same global flags, so ``ovnctl deploy --from acl`` and ``ovnctl acl``
@@ -80,8 +82,21 @@ STAGES = (
 def register(subparsers) -> argparse.ArgumentParser:
     p = subparsers.add_parser(NAME, help=HELP, description=__doc__,
                               formatter_class=argparse.RawDescriptionHelpFormatter)
+    # diagnose now runs by default -- seeing the state immediately after
+    # the deploy is the whole point of running one, and a check you have
+    # to remember to ask for is a check that gets skipped on the day it
+    # would have mattered.
+    #
+    # --verify is kept, and keeps its old meaning: run diagnose AND let
+    # its result set the exit code. That coupling stays opt-in because
+    # `ovnctl deploy && something-else` in existing automation must not
+    # start failing over a benign diagnose warning on a host where the
+    # deployment itself succeeded.
     p.add_argument("--verify", action="store_true",
-                   help="run 'ovnctl diagnose' once the deployment finishes")
+                   help="fail the deploy if the diagnose afterwards reports "
+                        "problems (diagnose runs either way)")
+    p.add_argument("--no-verify", action="store_true",
+                   help="skip the diagnose run at the end")
     add_step_args(p)
     p.set_defaults(func=main)
     return p
@@ -228,12 +243,15 @@ def main(ctx: Ctx, args: argparse.Namespace) -> int:
 
     dep.summary()
 
-    if args.verify:
+    if not getattr(args, "no_verify", False):
         dep.banner("diagnose")
         rc = dep._invoke(["diagnose"])
         if rc != 0:
             print(f"[ovn-deploy] diagnose reported problems (exit {rc}).",
                   file=sys.stderr)
-            return rc
+            if args.verify:
+                return rc
+            print("[ovn-deploy] deployment itself succeeded; pass --verify "
+                  "to make this fail the run.", file=sys.stderr)
 
     return 1 if dep.failed else 0
