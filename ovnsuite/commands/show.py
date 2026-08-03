@@ -874,22 +874,41 @@ def show_topology() -> None:
     art.add(f"  {DIM}br-int is omitted: every VIF and host-if binds to it "
             f"locally, on every path shown.{RST}")
 
+    # The user-VM segment is built on the first `user-vm --create`, not
+    # by deploy, so its absence is a steady state rather than drift. A
+    # site that never allocates a slot would otherwise carry a permanent
+    # warning about a thing it does not want -- and a warning that is
+    # always on is a warning nobody reads.
+    #
+    # Tracked slots change that: if the allocation file has entries and
+    # the switch is gone, the slots point at ports that no longer exist,
+    # and that IS worth shouting about.
+    tracked = len(user_vm_slots())
     expected = [g("topology", "lr_core", ""),
-                g("localnet_internal", "ls_uplink", "")] + wanted
+                g("localnet_internal", "ls_uplink", "")]
+    expected += [x for x in wanted if x != ls_user_n]
+    if tracked:
+        expected.append(ls_user_n)
+
     have = set(sw_ports) | set(routers)
     absent = [x for x in expected if x and x not in have]
     if absent:
         src = "ovn-settings.yaml" if cfg else "the built-in defaults"
         art.add(f"  {col.ylw}!{RST} in {src} but NOT deployed: "
                 f"{', '.join(absent)}")
+        if ls_user_n in absent:
+            art.add(f"    {DIM}{tracked} user-VM slot(s) are tracked in "
+                    f"state, so those ports are gone.{RST}")
         art.add(f"    {DIM}-> ovnctl deploy, or ovnctl diagnose to see "
                 f"why.{RST}")
+    elif ls_user_n and ls_user_n not in have:
+        art.add(f"  {DIM}{ls_user_n} is not built yet -- it is created on "
+                f"the first `ovnctl user-vm --create`.{RST}")
     if unexpected:
         art.add(f"  {col.ylw}!{RST} deployed but not in the settings file: "
                 f"{', '.join(unexpected)}")
     if ls_user_n in sw_ports:
-        tracked = len(user_vm_slots())
-        live = len([p for p in typed(ls_user_n, "vif")])
+        live = len(typed(ls_user_n, "vif"))
         if tracked != live:
             art.add(f"  {col.ylw}!{RST} user-VM tracker and db disagree: "
                     f"{tracked} in state, {live} in OVN.")
