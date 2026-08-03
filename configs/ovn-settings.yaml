@@ -452,6 +452,7 @@ acls:
     - "pg_ipa_server ips=172.31.1.30"
     # ext-vm1 only. Isolated, but SSH-able from the workstation LAN.
     - "pg_ext_mgmt names=ext-vm1"
+    - "pg_int_vms internal"
 
   rules:
     # --- management SSH in, no lateral SSH -----------------------------
@@ -475,6 +476,11 @@ acls:
     # flow in conntrack and the reply is matched by OVN's built-in
     # established/reply rules long before that drop is reached.
     - "extvm1-ssh-in  to-lport   1100 allow-related pg_ext_mgmt src=172.31.0.0/27 tcp=22 log"
+
+    - "intvm-internal-out from-lport 950 allow-related pg_int_vms dst=internal"
+    - "intvm-internal-in  to-lport   950 allow-related pg_int_vms src=internal"
+    - "intvm-terrain-out  from-lport 900 drop          pg_int_vms dst=any log"
+    - "intvm-terrain-in   to-lport   900 drop          pg_int_vms src=any log"
 
     # --- FreeIPA domain join: ext-vm2 (.35) -> int-vm4 (.30) ------------
     # Priority 2100 so these survive a future default-deny for lateral
