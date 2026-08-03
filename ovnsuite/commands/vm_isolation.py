@@ -29,7 +29,8 @@ import re
 
 from .. import netcalc, ovn, paths
 from ..config import load_legacy_ranges
-from ..context import Abort, Ctx, trace_verdict
+from ..context import (Abort, Ctx, acl_priority_of,
+                       trace_acl_priorities, trace_verdict)
 from ..inventory import Inventory
 from ..state import VM_ISOLATION, Tracker, record
 from ..steps import StepRunner, add_step_args
@@ -344,7 +345,7 @@ class VMIsolation:
                 "router port...")
         expr = (f'inport=="{self.ls_ext}-to-lr" && eth.src=={lrp_ext_mac} && '
                 f'eth.dst=={victim.mac} && ip4.src=={host_ip} && '
-                f'ip4.dst=={victim.ip} && ip.ttl==63 && icmp4')
+                f'ip4.dst=={victim.ip} && ip.ttl==63')
         out = ovn.trace(ctx, self.ls_ext, expr)
         verdict = trace_verdict(out)
 
@@ -382,6 +383,7 @@ class VMIsolation:
         # said nothing at all about the other three.
         blocked: list[str] = []
         unblocked: list[str] = []
+        exempted: list[str] = []
         unknown: list[str] = []
         last_expr = last_out = ""
         fail_expr = fail_out = ""
@@ -390,9 +392,19 @@ class VMIsolation:
             if member is None:
                 continue
             target = m_ip or member.ip
+            # Bare ip4, NOT icmp4. The isolation drop is protocol-agnostic,
+            # so any protocol tests it -- but ICMP is now deliberately
+            # exempted from it for troubleshooting ([acls] icmp-mgmt-in),
+            # and probing with the one protocol that has a documented
+            # exception makes this check report the exception as a
+            # failure. It did exactly that, and only on a RE-RUN: on a
+            # first deploy the acl stage has not run yet when this
+            # executes, so the exception does not exist and the same code
+            # passes. A check whose result depends on what a previous run
+            # left behind is worse than no check.
             expr = (f'inport=="{self.ls_ext}-to-lr" && eth.src=={lrp_ext_mac} && '
                     f'eth.dst=={member.mac} && ip4.src=={host_ip} && '
-                    f'ip4.dst=={target} && ip.ttl==63 && icmp4')
+                    f'ip4.dst=={target} && ip.ttl==63')
             out = ovn.trace(ctx, self.ls_ext, expr)
             verdict = trace_verdict(out)
             if verdict == "DROP":
@@ -401,13 +413,32 @@ class VMIsolation:
                 unknown.append(f"{m_name} ({target})")
                 last_expr, last_out = expr, out
             else:
-                unblocked.append(f"{m_name} ({target})")
-                if not fail_expr:
-                    fail_expr, fail_out = expr, out
+                # Allowed -- but by WHAT? A rule above this one is an
+                # intentional exception someone configured; nothing at all
+                # is a broken deployment. Naming the priority is the
+                # difference between "check your policy" and "check your
+                # northd".
+                decided = [p for p in trace_acl_priorities(out, "out")
+                           if p > 0]
+                mine = int(self.acl_priority)
+                higher = [p for p in decided if acl_priority_of(p) > mine]
+                if higher:
+                    exempted.append(
+                        f"{m_name} ({target}) via priority "
+                        f"{acl_priority_of(max(higher))}")
+                else:
+                    unblocked.append(f"{m_name} ({target})")
+                    if not fail_expr:
+                        fail_expr, fail_out = expr, out
 
         if blocked:
             ctx.log(f"  OK: {len(blocked)} member(s) correctly blocked from "
                     f"internal: {', '.join(blocked)}")
+        if exempted:
+            ctx.log(f"  {len(exempted)} member(s) reachable via a "
+                    f"higher-priority allow (configured exception):")
+            for line in exempted:
+                ctx.log(f"    {line}")
 
         # Separated deliberately. "the trace could not tell us" and "the
         # ACL is not working" are completely different problems, and
@@ -465,9 +496,21 @@ class VMIsolation:
         # If northd has not compiled the ACLs into logical flows, the trace
         # is describing a pipeline that does not contain them yet -- which
         # looks exactly like a missing ACL.
-        flows = ctx.qout("ovn-sbctl", "--bare", "--columns=_uuid", "find",
-                         "Logical_Flow", f"match~=\"{self.pg_name}\"")
-        n_flows = len([f for f in flows.splitlines() if f.strip()])
+        if not ctx.have("ovn-sbctl"):
+            ctx.warn("ovn-sbctl not available -- cannot tell whether northd "
+                     "has compiled these ACLs.")
+            return
+        res = ctx.q("ovn-sbctl", "--bare", "--columns=_uuid", "find",
+                    "Logical_Flow", f"match~=\"{self.pg_name}\"")
+        if not res:
+            # An empty result and a failed command look identical if you
+            # only read stdout, and announcing "northd has not compiled
+            # these ACLs" because the SB socket was unreadable sends
+            # someone to restart a daemon that was never the problem.
+            ctx.warn("Could not query the Southbound db, so whether northd "
+                     "has compiled these ACLs is unknown.")
+            return
+        n_flows = len([f for f in res.stdout.splitlines() if f.strip()])
         if n_flows:
             ctx.warn(f"Southbound logical flows referencing {self.pg_name}: "
                      f"{n_flows} (northd has compiled them).")
