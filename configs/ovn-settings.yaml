@@ -453,6 +453,7 @@ acls:
     # ext-vm1 only. Isolated, but SSH-able from the workstation LAN.
     - "pg_ext_mgmt names=ext-vm1"
     - "pg_int_vms internal"
+    - "pg_all_vms all"
 
   rules:
     # --- management SSH in, no lateral SSH -----------------------------
@@ -508,12 +509,12 @@ acls:
     - "ipa-no-ssh  172.31.1.35 172.31.1.30 tcp  22  DROP"
     # Workstation LAN -> IPA server. The source is not a VM, so the trace
     # enters via the router port rather than an inport on the switch.
-    - "wks-ldap    172.31.0.5  172.31.1.30 tcp  389 ALLOW"
-    - "wks-krb     172.31.0.5  172.31.1.30 udp  88  ALLOW"
-    - "wks-https   172.31.0.5  172.31.1.30 tcp  443 ALLOW"
-    - "wks-dns     172.31.0.5  172.31.1.30 udp  53  ALLOW"
-    - "wks-ping    172.31.0.5  172.31.1.30 icmp -   ALLOW"
-    - "wks-ssh     172.31.0.5  172.31.1.30 tcp  22  ALLOW"
+    - "wks-ldap    172.31.0.11  172.31.1.30 tcp  389 ALLOW"
+    - "wks-krb     172.31.0.11  172.31.1.30 udp  88  ALLOW"
+    - "wks-https   172.31.0.11  172.31.1.30 tcp  443 ALLOW"
+    - "wks-dns     172.31.0.11  172.31.1.30 udp  53  ALLOW"
+    - "wks-ping    172.31.0.11  172.31.1.30 icmp -   ALLOW"
+    - "wks-ssh     172.31.0.11  172.31.1.30 tcp  22  ALLOW"
 
 
 # ----------------------------------------------------------------------------

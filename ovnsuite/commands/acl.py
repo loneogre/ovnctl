@@ -110,7 +110,7 @@ def register(subparsers) -> argparse.ArgumentParser:
 #: A destination outside every internal range, for probing catch-all
 #: rules. TEST-NET-3 by RFC 5737, and already the address the built-in
 #: "external OK" check uses -- one convention, not two.
-_OFFNET = "203.0.113.10"
+_OFFNET = "192.168.20.10"
 
 
 def _short(ref: str, keep: int = 8) -> str:
@@ -1319,10 +1319,10 @@ class ACLManager:
                     f'eth.dst=={v1.mac} && ip4.src=={host_ip} && '
                     f'ip4.dst=={v1.ip} && ip.ttl==63 && tcp && tcp.dst==22')
 
-        self._check(f"workstation 172.31.0.5 -> {v1.name} :22", "ALLOW",
+        self._check(f"workstation 172.31.0.11 -> {v1.name} :22", "ALLOW",
                     self.ls_int,
                     f'inport=="{self.ls_int}-to-lr" && eth.src=={lrp_int_mac} && '
-                    f'eth.dst=={v1.mac} && ip4.src==172.31.0.5 && '
+                    f'eth.dst=={v1.mac} && ip4.src==172.31.0.11 && '
                     f'ip4.dst=={v1.ip} && ip.ttl==63 && tcp && tcp.dst==22')
 
         # Lateral SSH -- must be dropped.
@@ -1355,11 +1355,11 @@ class ACLManager:
         self._verify_configured_pairs(lrp_int_mac, lrp_ext_mac)
 
         # Engagement traffic out must survive.
-        self._check(f"{ev.name} -> 203.0.113.10 :22 (external OK)", "ALLOW",
+        self._check(f"{ev.name} -> 192.168.20.10 :22 (external OK)", "ALLOW",
                     self.ls_ext,
                     f'inport=="{ev.uuid}" && eth.src=={ev.mac} && '
                     f'eth.dst=={lrp_ext_mac} && ip4.src=={ev.ip} && '
-                    f'ip4.dst==203.0.113.10 && ip.ttl==64 && tcp && tcp.dst==22')
+                    f'ip4.dst==192.168.20.10 && ip.ttl==64 && tcp && tcp.dst==22')
 
         total = self.v_ok + self.v_fail + self.v_warn + self.v_shadow
         c = self.c
