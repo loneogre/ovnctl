@@ -167,6 +167,7 @@ class ACLManager:
         # do_verify's locals so the per-rule reporter can count without
         # threading a result object through every helper.
         self.v_ok = self.v_fail = self.v_warn = self.v_shadow = 0
+        self.v_note = 0
         self.v_skip = 0
         self.quick_verify = False
         self.c = Colour()
@@ -1150,6 +1151,7 @@ class ACLManager:
         skipped = []
         unreachable = []
         downstream = []
+        superseded = []
         for plabel, peer_ip, expect, verdict, mine, every, far, out in results:
             decided_here = [p for p in mine if p > 0]
             decided_any = [p for p in every if p > 0]
@@ -1183,7 +1185,18 @@ class ACLManager:
                 # was never offered. The usual cause is the paired
                 # from-lport rule at the same priority doing its job.
                 unreachable.append((plabel, peer_ip, max(decided_any)))
+            elif decided_any and verdict == expect:
+                # A rule above this one claimed the packet and reached the
+                # SAME conclusion. That is layering working, not a fault:
+                # a deliberate high-priority allow is expected to sit over
+                # the specific allows it generalises. The policy outcome
+                # is unchanged, so this is worth stating and not worth
+                # shouting about.
+                superseded.append(
+                    (plabel, peer_ip, max(decided_any), verdict))
             elif decided_any:
+                # Claimed by another rule AND the outcome differs from
+                # what this rule says. That one matters.
                 shadowed.append((plabel, peer_ip, max(decided_any), verdict))
             elif want_prio >= 0:
                 # Nothing in the ACL stage claimed the packet at all.
@@ -1205,6 +1218,16 @@ class ACLManager:
             self.v_skip += 1
             print(f"  {self.tag('skip')} {label:<46} "
                   f"{self.c.dim}{skipped[0][2]}{self.c.rst}")
+        elif superseded and not ok and not shadowed:
+            # Every probe was answered by a higher-priority rule with the
+            # same outcome. The rule is redundant as things stand, which
+            # is information, not a problem -- and if the rule above it
+            # is ever narrowed, this one is what catches the traffic.
+            self.v_note += 1
+            prio = acl_priority_of(superseded[0][2])
+            print(f"  {self.tag('note')} {label:<46} {self.c.dim}"
+                  f"same outcome from priority {prio} "
+                  f"({len(superseded)}/{n} probes){self.c.rst}")
         elif downstream and not ok and not shadowed and not unreachable:
             self.v_ok += 1
             print(f"  {self.tag('ok')} {label:<46} {self.c.dim}"
@@ -1220,7 +1243,7 @@ class ACLManager:
             print(f"  {self.tag('warn')} {label:<46} no verdict (trace failed/timed out)")
             for line in (unmeasured[0][2].splitlines()[-4:] or ["(no output)"]):
                 print(f"         {line}")
-        elif shadowed:
+        elif shadowed and not ok:
             self.v_shadow += 1
             first = shadowed[0]
             where = (f"priority {acl_priority_of(first[2])}" if first[2]
@@ -1241,12 +1264,18 @@ class ACLManager:
                 notes.append(f"{len(unreachable)} never reached egress")
             if downstream:
                 notes.append(f"{len(downstream)} dropped at the far end")
+            if superseded:
+                notes.append(f"{len(superseded)} covered by priority "
+                             f"{acl_priority_of(superseded[0][2])}")
+            if shadowed:
+                notes.append(f"{len(shadowed)} shadowed")
             extra = ", " + ", ".join(notes) if notes else ""
             print(f"  {self.tag('ok')} {label:<46} {self.c.dim}{len(ok)}/{n} probe(s){extra}{self.c.rst}")
 
     _TAGS = {"ok": ("[ OK ]", "grn", False), "fail": ("[FAIL]", "red", True),
              "warn": ("[WARN]", "ylw", False), "dead": ("[DEAD]", "mag", False),
-             "skip": ("[SKIP]", "dim", False)}
+             "skip": ("[SKIP]", "dim", False),
+             "note": ("[NOTE]", "dim", False)}
 
     def tag(self, kind: str) -> str:
         """A coloured status tag, matching --audit's palette exactly.
@@ -1351,7 +1380,8 @@ class ACLManager:
                     f'eth.dst=={lrp_ext_mac} && ip4.src=={ev.ip} && '
                     f'ip4.dst==203.0.113.10 && ip.ttl==64 && tcp && tcp.dst==22')
 
-        total = self.v_ok + self.v_fail + self.v_warn + self.v_shadow
+        total = (self.v_ok + self.v_fail + self.v_warn + self.v_shadow
+                 + self.v_note)
         c = self.c
         def n(count: int, colour: str) -> str:
             # A zero is good news for every counter but the first, so
@@ -1361,8 +1391,15 @@ class ACLManager:
               f"{n(self.v_ok, c.grn)} ok, "
               f"{n(self.v_fail, c.red)} failed, "
               f"{n(self.v_shadow, c.mag)} dead/shadowed, "
+              f"{n(self.v_note, c.dim)} redundant, "
               f"{n(self.v_warn, c.ylw)} unmeasured, "
               f"{n(self.v_skip, c.dim)} skipped")
+        if self.v_note and not (self.v_fail or self.v_shadow):
+            print(f"  {c.dim}A REDUNDANT rule is correct and enforced -- a "
+                  f"higher-priority rule simply reaches{c.rst}")
+            print(f"  {c.dim}the same conclusion first. Nothing to fix; it "
+                  f"still catches the traffic if that{c.rst}")
+            print(f"  {c.dim}rule is ever narrowed.{c.rst}")
         if self.v_fail or self.v_shadow:
             print(f"  {c.dim}A DEAD rule is deployed correctly but never "
                   f"decides anything -- check for a{c.rst}")
