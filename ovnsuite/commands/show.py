@@ -756,12 +756,27 @@ def show_topology() -> None:
         if kind == "world":
             left, right = _MARGIN, _MARGIN + bar - _CELL
             pad = " " * wgap
+            def broken(head_left: bool) -> str:
+                """A link drawn with a // break in it.
+
+                The workstation LAN is not adjacent to the ASA -- there
+                are further hops in between that this picture does not
+                model, and an unbroken line says the opposite. The break
+                replaces two dashes rather than adding any, so the column
+                arithmetic is untouched and the ASCII fallback needs no
+                special case: `/` survives the translation as itself.
+                """
+                span = wgap - 1                 # dashes, minus the head
+                a = (span - 2) // 2
+                body = "─" * a + "//" + "─" * (span - 2 - a)
+                return ("◄" + body) if head_left else (body + "►")
+
             art.add(" " * left, c_top(OUT, False), pad, c_top(OUT, False),
                     pad, c_top(OUT, False))
             art.add(" " * left, c_txt("workstation LAN", OUT),
-                    art.cell("◄" + "─" * (wgap - 1), OUT),
+                    art.cell(broken(True), OUT),
                     c_txt("ASA firewall", OUT),
-                    art.cell("─" * (wgap - 1) + "►", OUT),
+                    art.cell(broken(False), OUT),
                     c_txt("client targets", OUT))
             art.add(" " * left, c_txt(ws_label or "outside OVN", OUT),
                     pad, c_txt(asa or "?", OUT),
@@ -873,6 +888,9 @@ def show_topology() -> None:
             f"{TRU}▪{RST} trusted   {ISO}▪{RST} isolated by port group")
     art.add(f"  {DIM}br-int is omitted: every VIF and host-if binds to it "
             f"locally, on every path shown.{RST}")
+    if any(k == "world" for k, _c, _l in stack):
+        art.add(f"  {DIM}// marks a link with further hops that are outside "
+                f"OVN and not modelled here.{RST}")
 
     # The user-VM segment is built on the first `user-vm --create`, not
     # by deploy, so its absence is a steady state rather than drift. A
@@ -902,7 +920,8 @@ def show_topology() -> None:
         art.add(f"    {DIM}-> ovnctl deploy, or ovnctl diagnose to see "
                 f"why.{RST}")
     elif ls_user_n and ls_user_n not in have:
-        art.add(f"  {DIM}{ls_user_n} is not built yet. {RST}")
+        art.add(f"  {DIM}{ls_user_n} is not built yet -- it is created on "
+                f"the first `ovnctl user-vm --create`.{RST}")
     if unexpected:
         art.add(f"  {col.ylw}!{RST} deployed but not in the settings file: "
                 f"{', '.join(unexpected)}")
