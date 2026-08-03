@@ -155,12 +155,16 @@ class ACLAudit:
             return
         for pg in live:
             group = db[pg]
+            # Named explicitly, one group at a time. There is no longer a
+            # flag that clears the lot -- see the note in acl.py's
+            # register() -- and a remedy line is not the place to hand
+            # someone a shortcut past that.
             self.fail(f"{pg} is still deployed",
                       "acls.enabled is false, but this port group is present "
                       "and its ACLs are still being enforced.",
                       f"members     {len(group.ports)}",
                       f"acls        {len(group.acls)}",
-                      "remedy      ovnctl acl --remove")
+                      f"remedy      ovn-nbctl pg-del {pg}")
 
     # ------------------------------------------------------------------
     # 1. is the configuration sound?

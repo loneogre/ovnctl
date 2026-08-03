@@ -39,7 +39,7 @@ from ..context import (Abort, Colour, Ctx, acl_priority_matched,
                        acl_priority_of, trace_acl_priorities,
                        trace_verdict)
 from ..inventory import Inventory
-from ..state import ACLS, Tracker, record
+from ..state import ACLS, record
 from ..steps import StepRunner, add_step_args
 from .acl_audit import ACLAudit, _norm
 
@@ -90,9 +90,13 @@ class ParsedRule:
 def register(subparsers) -> argparse.ArgumentParser:
     p = subparsers.add_parser(NAME, help=HELP, description=__doc__,
                               formatter_class=argparse.RawDescriptionHelpFormatter)
+    # No --remove. Deleting the whole policy was one flag away, which is
+    # too short a path for an action with no confirmation, no partial
+    # form and no undo. Editing ovn-settings.yaml and re-applying is
+    # deliberately more work; `ovnctl delete` exists for a real teardown;
+    # and a single group can still be dropped by hand with
+    # `ovn-nbctl pg-del <name>` when that is genuinely what is wanted.
     g = p.add_mutually_exclusive_group()
-    g.add_argument("--remove", action="store_true",
-                   help="remove the groups and their ACLs")
     g.add_argument("--verify", action="store_true",
                    help="ovn-trace every configured rule, plus verify_pairs")
     g.add_argument("--list", dest="do_list", action="store_true",
@@ -110,7 +114,7 @@ def register(subparsers) -> argparse.ArgumentParser:
 #: A destination outside every internal range, for probing catch-all
 #: rules. TEST-NET-3 by RFC 5737, and already the address the built-in
 #: "external OK" check uses -- one convention, not two.
-_OFFNET = "192.168.20.10"
+_OFFNET = "203.0.113.10"
 
 
 def _short(ref: str, keep: int = 8) -> str:
@@ -549,20 +553,6 @@ class ACLManager:
             print(f"{pg}  ({sel})  members: {n}")
             for line in ovn.acl_list(ctx, pg):
                 print(f"    {line}")
-
-    def do_remove(self) -> None:
-        ctx = self.ctx
-        ctx.log("Removing ACL port groups and their rules...")
-        for pg, _sel in self.group_defs:
-            if not pg:
-                continue
-            if ovn.pg_exists(ctx, pg):
-                if ctx.run("ovn-nbctl", "pg-del", pg):
-                    ctx.log(f"Removed {pg} (and its ACLs).")
-            else:
-                ctx.log(f"{pg} does not exist.")
-        Tracker(ctx).unmark(ACLS)
-        ctx.log("Done. VM-to-VM traffic is unrestricted again.")
 
     # ------------------------------------------------------------------
     # generated coverage
@@ -1319,10 +1309,10 @@ class ACLManager:
                     f'eth.dst=={v1.mac} && ip4.src=={host_ip} && '
                     f'ip4.dst=={v1.ip} && ip.ttl==63 && tcp && tcp.dst==22')
 
-        self._check(f"workstation 172.31.0.11 -> {v1.name} :22", "ALLOW",
+        self._check(f"workstation 172.31.0.5 -> {v1.name} :22", "ALLOW",
                     self.ls_int,
                     f'inport=="{self.ls_int}-to-lr" && eth.src=={lrp_int_mac} && '
-                    f'eth.dst=={v1.mac} && ip4.src==172.31.0.11 && '
+                    f'eth.dst=={v1.mac} && ip4.src==172.31.0.5 && '
                     f'ip4.dst=={v1.ip} && ip.ttl==63 && tcp && tcp.dst==22')
 
         # Lateral SSH -- must be dropped.
@@ -1355,11 +1345,11 @@ class ACLManager:
         self._verify_configured_pairs(lrp_int_mac, lrp_ext_mac)
 
         # Engagement traffic out must survive.
-        self._check(f"{ev.name} -> 192.168.20.10 :22 (external OK)", "ALLOW",
+        self._check(f"{ev.name} -> 203.0.113.10 :22 (external OK)", "ALLOW",
                     self.ls_ext,
                     f'inport=="{ev.uuid}" && eth.src=={ev.mac} && '
                     f'eth.dst=={lrp_ext_mac} && ip4.src=={ev.ip} && '
-                    f'ip4.dst==192.168.20.10 && ip.ttl==64 && tcp && tcp.dst==22')
+                    f'ip4.dst==203.0.113.10 && ip.ttl==64 && tcp && tcp.dst==22')
 
         total = self.v_ok + self.v_fail + self.v_warn + self.v_shadow
         c = self.c
@@ -1478,9 +1468,6 @@ def main(ctx: Ctx, args: argparse.Namespace) -> int:
         ctx.log("acls.enabled is false -- nothing to do.")
         return 0
 
-    if args.remove:
-        cmd.do_remove()
-        return 0
     if args.verify:
         cmd.quick_verify = bool(getattr(args, "quick", False))
         return cmd.do_verify()
