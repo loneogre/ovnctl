@@ -55,6 +55,19 @@ STAGES = (
     # a no-op when nothing is allocated.
     ("user-vm", ["user-vm", "--reapply"], REQUIRED,
      "user-VM slots recorded in state/user-vms.json"),
+    # Boot persistence. Nothing in the deployment depends on it, and
+    # nothing fails today if it is missing -- which is exactly why it got
+    # skipped: the only symptom is that the next reboot drops the runtime
+    # state, and by then whoever ran the deploy has moved on. Installing
+    # it every time costs a file write and makes the omission impossible.
+    #
+    # OPTIONAL because a host without systemd, or with a read-only /etc,
+    # must still be able to complete a deployment; --install-unit already
+    # returns non-zero rather than raising in those cases. A skip here is
+    # called out by name in the summary instead of scrolling past as one
+    # more WARN line.
+    ("persistence", ["reconcile", "--install-unit"], OPTIONAL,
+     "boot-time reconcile unit (ovn-reconcile.service)"),
     # Host-side helpers. These depend on things outside OVN (libvirt,
     # tcpdump, running VMs) and are expected to no-op on some hosts.
     ("vm-attach", ["vm-attach"], OPTIONAL,
@@ -173,6 +186,19 @@ class Deploy:
         for s in self.failed:
             print(f"  failed:  {s}")
         print("")
+
+        # A skipped optional stage is usually fine. This one is not: it is
+        # the only stage whose absence has no effect until the host next
+        # reboots, at which point the runtime state is gone and the deploy
+        # that failed to install it is long forgotten.
+        if any(s.startswith("persistence") for s in self.skipped + self.failed):
+            print(f"{self.c.ylw}The boot-time reconcile unit was NOT "
+                  f"installed.{self.c.rst}")
+            print("Everything deployed will be lost on reboot until you "
+                  "run:")
+            print("  ovnctl reconcile --install-unit")
+            print("")
+
         print("Verify with:  ovnctl diagnose")
 
 
