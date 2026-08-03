@@ -26,6 +26,7 @@ FIXES CARRIED OVER FROM THE SHELL VERSION
 from __future__ import annotations
 
 import argparse
+import os
 import re
 from pathlib import Path
 
@@ -38,6 +39,39 @@ from ..steps import StepRunner, add_step_args
 
 NAME = "diagnose"
 HELP = "layer-by-layer health check of the OVN/OVS stack"
+
+RECONCILE_UNIT = Path("/etc/systemd/system/ovn-reconcile.service")
+
+
+def _exec_start_problem(exec_start: str) -> tuple[str, str]:
+    """(severity, message) for an ExecStart systemd may not be able to spawn.
+
+    severity is "fatal" for something that will certainly produce
+    status=203/EXEC, "hint" for something that often does, and "" for no
+    problem found.
+
+    Worth checking by name because being root does not make 203/EXEC go
+    away, which is the first thing everyone assumes. Root bypasses the
+    permission bits for read and write but still needs an execute bit
+    somewhere, and it bypasses neither SELinux nor a noexec mount. The
+    result is a unit that runs perfectly when you type the same path at a
+    shell and fails at every boot.
+    """
+    if not exec_start:
+        return "", ""
+    path = Path(exec_start.split()[0])
+    if not path.exists():
+        return "fatal", f"{path} does not exist -> status=203/EXEC at boot."
+    if not os.access(path, os.X_OK):
+        return "fatal", f"{path} has no execute bit -> status=203/EXEC at boot."
+    if str(path).startswith("/home/"):
+        # os.access() answers the DAC question only, and this one is not a
+        # DAC question: SELinux labels /home as user_home_t, which the
+        # init_t domain systemd starts services from is not permitted to
+        # execute. Nothing visible on the file says so.
+        return "hint", (f"{path} is under /home; on an SELinux-enforcing host "
+                        "systemd cannot execute it there.")
+    return "", ""
 
 PASS = "[ OK ]"
 FAIL = "[FAIL]"
@@ -1354,6 +1388,72 @@ class Diagnose:
 
         self._check_persistence()
 
+    def _reconcile_unit_state(self) -> tuple[str, str]:
+        """(state, ExecStart) for ovn-reconcile.service.
+
+        state is one of:
+          "off"    -- not installed, or installed and not enabled
+          "failed" -- enabled, and systemd is holding it failed
+          "ran"    -- enabled and active; with Type=oneshot plus
+                      RemainAfterExit=yes, active means it completed
+                      cleanly in this boot
+          "armed"  -- enabled, correct, and not run in this boot, which is
+                      the normal state immediately after `deploy` installs
+                      it
+
+        `systemctl is-enabled` alone cannot separate the last three, and
+        that is the gap this closes: an enabled unit that dies at every
+        boot with status=203/EXEC answers `is-enabled` exactly as a
+        working one does.
+
+        ExecStart is read out of the unit file rather than asked of
+        systemctl, whose `show -p ExecStart` output format is both verbose
+        and version-dependent. A drop-in that overrides ExecStart would
+        not be seen here; ovnctl does not write one.
+        """
+        ctx = self.ctx
+        if not RECONCILE_UNIT.exists() or not ctx.have("systemctl"):
+            return "off", ""
+
+        exec_start = ""
+        try:
+            for line in RECONCILE_UNIT.read_text(encoding="utf-8").splitlines():
+                if line.startswith("ExecStart="):
+                    exec_start = line.split("=", 1)[1].strip()
+                    break
+        except OSError:
+            pass
+
+        if not ctx.q("systemctl", "is-enabled", "ovn-reconcile.service").ok:
+            return "off", exec_start
+        # `is-failed` exits 0 when the unit IS failed -- the inversion is
+        # deliberate on systemd's part and easy to write backwards.
+        if ctx.q("systemctl", "is-failed", "ovn-reconcile.service").ok:
+            return "failed", exec_start
+        if ctx.q("systemctl", "is-active", "ovn-reconcile.service").ok:
+            return "ran", exec_start
+        return "armed", exec_start
+
+    def _nm_state(self, keyfile: Path, managed_conf: Path) -> str:
+        """How much of host-if NetworkManager will actually reapply at boot.
+
+        "none"     -- no keyfile
+        "unmanaged"-- keyfile, but NM will not manage the device, so it
+                      never autoconnects and the keyfile does nothing
+        "runtime"  -- keyfile and managed, but the managed flag lives in
+                      /run and is gone at the next boot
+        "ok"       -- keyfile, managed, and the flag is in conf.d
+        """
+        if not keyfile.exists():
+            return "none"
+        state = self.ctx.qout("nmcli", "-g", "GENERAL.STATE", "device", "show",
+                              self.host_if).strip().lower()
+        if "unmanaged" in state:
+            return "unmanaged"
+        if not managed_conf.exists():
+            return "runtime"
+        return "ok"
+
     def _check_persistence(self) -> None:
         """Is anything going to reapply this at the next boot?
 
@@ -1363,47 +1463,117 @@ class Diagnose:
         mechanisms can prevent it and neither is visible from the
         interface state, so check for them explicitly rather than let a
         fully green section 7 imply a persistence that is not there.
+
+        The two are not peers, and this used to read as though they were.
+        ovn-reconcile.service reapplies the entire runtime state --
+        system-id, gateway pins, host-if, the ovn-controller claim check,
+        the acl_log level. A NetworkManager keyfile covers host-if's
+        address and routes and nothing else. The unit is the mechanism;
+        NM is the part that gets an address on the interface early, before
+        the unit runs. Calling the unit a "backstop" for the smaller of
+        the two had it exactly backwards.
         """
-        ctx = self.ctx
         keyfile = Path("/etc/NetworkManager/system-connections") / \
             f"{self.host_if}.nmconnection"
         managed_conf = Path("/etc/NetworkManager/conf.d/99-ovnctl-host-if.conf")
-        unit = Path("/etc/systemd/system/ovn-reconcile.service")
 
-        unit_armed = unit.exists() and ctx.q(
-            "systemctl", "is-enabled", "ovn-reconcile.service").ok
+        unit_state, exec_start = self._reconcile_unit_state()
+        severity, problem = _exec_start_problem(exec_start)
 
-        if not keyfile.exists():
-            if unit_armed:
-                self.ok("ovn-reconcile.service is enabled; it will reapply this "
-                        "at boot.")
-            else:
-                self.bad("Nothing will reapply this configuration after a reboot.")
-                self.detail(
-                    "No NetworkManager keyfile and no enabled ovn-reconcile.service.",
-                    f"{self.host_if} will come back with no address and no routes.",
-                    "-> ovnctl reconcile --install-nm-profile",
-                    "-> ovnctl reconcile --install-unit")
+        # Reported ahead of anything about NetworkManager, and reported as
+        # a failure: an enabled unit that dies is worse than no unit,
+        # because every cheap signal -- the file exists, is-enabled says
+        # yes -- agrees the host is covered when it is not.
+        if unit_state == "failed":
+            self.bad("ovn-reconcile.service is enabled but its last run failed.")
+            lines = ["A failing unit reapplies nothing, and `is-enabled` cannot "
+                     "tell it",
+                     "apart from one that works."]
+            if exec_start:
+                lines.append(f"ExecStart={exec_start}")
+            if problem:
+                lines.append(problem)
+            lines.append("-> systemctl status ovn-reconcile.service")
+            self.detail(*lines)
             return
 
-        # A keyfile only autoconnects if NetworkManager is willing to
-        # manage the device, and it will not manage an OVS internal port
-        # unless told to. `nmcli device set ... managed yes` writes to
-        # /run, so it is gone by the next boot -- the flag has to be in
-        # conf.d to survive, and a keyfile without it is the exact shape
-        # of "works until you reboot".
-        state = ctx.qout("nmcli", "-g", "GENERAL.STATE", "device", "show",
-                         self.host_if).strip().lower()
-        if "unmanaged" in state:
+        # Same failure, caught before the reboot that would expose it.
+        if unit_state == "armed" and severity == "fatal":
+            self.bad("ovn-reconcile.service is enabled but cannot start: "
+                     f"{problem}")
+            self.detail(
+                "It has not run in this boot, so nothing has surfaced yet; it",
+                "will fail at the next one.",
+                "-> reinstall from the path ovnctl actually lives at now:",
+                "   ovnctl reconcile --install-unit")
+            return
+
+        nm_state = self._nm_state(keyfile, managed_conf)
+        unit_armed = unit_state in ("ran", "armed")
+
+        if unit_armed:
+            if nm_state == "ok":
+                self.ok("Persistent: ovn-reconcile.service reapplies the full "
+                        "runtime state at boot, with a NetworkManager keyfile "
+                        f"bringing {self.host_if}'s address up first.")
+            elif nm_state == "none":
+                self.ok("Persistent: ovn-reconcile.service is enabled and will "
+                        "reapply this at boot.")
+            else:
+                # An ineffective keyfile is cosmetic once the unit is in
+                # place -- the unit reapplies the address anyway -- so this
+                # is a note rather than the failure it would be on its own.
+                self.ok("Persistent: ovn-reconcile.service is enabled and will "
+                        "reapply this at boot.")
+                if nm_state == "unmanaged":
+                    self.note(f"The NetworkManager keyfile for {self.host_if} "
+                              "is inert: NM will not manage the device, so it "
+                              "never autoconnects.")
+                else:
+                    self.note(f"The NetworkManager keyfile for {self.host_if} "
+                              f"will not autoconnect at boot: {managed_conf.name} "
+                              "is missing, so the managed flag is set in /run "
+                              "only.")
+                self.detail(
+                    f"{self.host_if} will still come up, later, when the unit "
+                    "runs.",
+                    "-> ovnctl reconcile --install-nm-profile   (to fix the "
+                    "keyfile)")
+            if unit_state == "armed":
+                self.detail("The unit has not run in this boot, so it is enabled "
+                            "but unproven here.",
+                            "-> systemctl start ovn-reconcile.service   (to prove "
+                            "it before the reboot does)")
+            # Only worth raising while the unit is unproven. Once it has
+            # run in this boot, systemd has demonstrably executed that
+            # path and the heuristic is a false positive.
+            if severity == "hint" and unit_state == "armed":
+                self.note(f"ovn-reconcile.service may not survive a reboot: "
+                          f"{problem}")
+            return
+
+        # No usable unit from here down.
+        if nm_state == "none":
+            self.bad("Nothing will reapply this configuration after a reboot.")
+            self.detail(
+                "No enabled ovn-reconcile.service and no NetworkManager keyfile.",
+                f"{self.host_if} will come back with no address and no routes,",
+                "and system-id, the gateway pins and the claim check go with it.",
+                "-> ovnctl reconcile --install-unit          (covers all of it)",
+                "-> ovnctl reconcile --install-nm-profile    (host-if only)")
+            return
+
+        if nm_state == "unmanaged":
             self.bad(f"NetworkManager keyfile exists but {self.host_if} is "
-                     "unmanaged.")
+                     "unmanaged, and there is no ovn-reconcile.service.")
             self.detail(
                 "An unmanaged device never autoconnects, so the keyfile does",
-                "nothing at boot.",
+                "nothing at boot and nothing else is covering it.",
+                "-> ovnctl reconcile --install-unit",
                 f"-> ovnctl reconcile --install-nm-profile   (writes {managed_conf})")
             return
 
-        if not managed_conf.exists():
+        if nm_state == "runtime":
             self.note(f"Keyfile is present and {self.host_if} is managed, but "
                       f"{managed_conf.name} is missing.")
             self.detail(
@@ -1413,15 +1583,12 @@ class Diagnose:
                 "-> ovnctl reconcile --install-nm-profile")
             return
 
-        if unit_armed:
-            self.ok("Persistent: NetworkManager keyfile + managed flag, with "
-                    "ovn-reconcile.service as a backstop.")
-        else:
-            self.ok("Persistent: NetworkManager keyfile + managed flag in "
-                    "conf.d.")
-            self.detail("`ovnctl reconcile --install-unit` would add a backstop "
-                        "for what NetworkManager cannot fix (system-id, gateway "
-                        "pins, a broken OVS port).")
+        self.ok(f"Persistent: NetworkManager will reapply {self.host_if}'s "
+                "address and routes at boot.")
+        self.detail(
+            "That covers this interface only. system-id, the gateway pins and",
+            "the ovn-controller claim check are not NetworkManager's to fix.",
+            "-> ovnctl reconcile --install-unit")
 
     # ------------------------------------------------------------------
     # 8
