@@ -902,8 +902,7 @@ def show_topology() -> None:
         art.add(f"    {DIM}-> ovnctl deploy, or ovnctl diagnose to see "
                 f"why.{RST}")
     elif ls_user_n and ls_user_n not in have:
-        art.add(f"  {DIM}{ls_user_n} is not built yet -- it is created on "
-                f"the first `ovnctl user-vm --create`.{RST}")
+        art.add(f"  {DIM}{ls_user_n} is not built yet. {RST}")
     if unexpected:
         art.add(f"  {col.ylw}!{RST} deployed but not in the settings file: "
                 f"{', '.join(unexpected)}")
