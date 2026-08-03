@@ -107,6 +107,12 @@ def register(subparsers) -> argparse.ArgumentParser:
     return p
 
 
+#: A destination outside every internal range, for probing catch-all
+#: rules. TEST-NET-3 by RFC 5737, and already the address the built-in
+#: "external OK" check uses -- one convention, not two.
+_OFFNET = "203.0.113.10"
+
+
 def _short(ref: str, keep: int = 8) -> str:
     """A port reference short enough for a status line.
 
@@ -160,6 +166,7 @@ class ACLManager:
         self.v_skip = 0
         self.quick_verify = False
         self.c = Colour()
+        self._gw_cache: set[str] | None = None
 
     @staticmethod
     def _split2(entry: str) -> tuple[str, str]:
@@ -314,7 +321,7 @@ class ACLManager:
             return
 
         conf = RSYSLOG_CONF.format(target=target)
-        path = "/etc/rsyslog.d/11-ovn-acl.conf"
+        path = "/etc/rsyslog.d/10-ovn-acl.conf"
         if ctx.dry_run:
             print(f"cat > {path} <<'EOF'")
             print(conf, end="")
@@ -571,16 +578,48 @@ class ACLManager:
     # ACL can be deployed exactly as written and still be dead, because a
     # higher-priority rule matches the same packets first.
 
-    def _sample_ip(self, spec: str) -> str:
+    def _gateway_ips(self) -> set[str]:
+        """Every router-port address, which must never be probed AT.
+
+        lr_in_ip_input drops IP addressed to the router itself unless it is
+        something the router answers, so a probe aimed at a gateway comes
+        back DROP from the ROUTER, before any ACL is consulted. That reads
+        as a failed rule and is nothing of the kind.
+        """
+        if self._gw_cache is None:
+            out: set[str] = set()
+            try:
+                for row in ovn.nb_json(self.ctx, "networks",
+                                       "Logical_Router_Port"):
+                    for cidr in self._ovsdb_set(row[0] if row else ""):
+                        out.add(cidr.split("/")[0])
+            except Abort:
+                pass
+            for sec, key in (("setup", "lrp_int_cidr"),
+                             ("setup", "lrp_ext_cidr"),
+                             ("setup", "lrp_host_cidr"),
+                             ("localnet_internal", "transit_ip")):
+                val = self.ctx.config.cfg_opt(sec, key, "")
+                if val:
+                    out.add(val.split("/")[0])
+            gw = self.ctx.config.cfg_opt("user_vms", "gateway", "")
+            if gw:
+                out.add(gw)
+            self._gw_cache = out
+        return self._gw_cache
+
+    def _sample_ip(self, spec: str, avoid: set[str] | None = None) -> str:
         """One concrete address to trace from inside a CIDR or literal.
 
         ovn-trace needs an address, not a prefix. A /32 is itself; anything
-        wider yields its first usable host, which for the /30s in this
-        topology is the useful end of the link rather than the network
-        address.
+        wider yields its first usable host -- unless that host is a router
+        port, in which case walk on. The first host of a /28 is the
+        gateway by convention in this topology, so taking it blindly is
+        the common case, not an edge case.
         """
         import ipaddress
         spec = spec.strip()
+        avoid = avoid or set()
         if not spec:
             return ""
         try:
@@ -589,6 +628,9 @@ class ACLManager:
             return ""
         if net.prefixlen >= 31:
             return str(net.network_address)
+        for host in net.hosts():
+            if str(host) not in avoid:
+                return str(host)
         return str(next(net.hosts(), net.network_address))
 
     def _spec_of(self, rule: ParsedRule, prefix: str) -> str:
@@ -625,19 +667,22 @@ class ACLManager:
         local = members[0]
         far_spec = self._spec_of(rule, "src=" if inbound else "dst=")
         far_spec = self.expand_cidrs(far_spec) if far_spec else ""
+        gws = self._gateway_ips()
 
         if not far_spec or far_spec == "any":
-            # An unconstrained end means the rule is about lateral traffic
-            # between group members. Trace member -> member, which is the
-            # case these rules exist to catch; with only one member there
-            # is no such packet and the rule cannot be exercised.
-            peer = next((v for v in members if v.ip != local.ip), None)
-            if peer is None:
-                return [], f"{rule.group} has one member -- no lateral peer"
-            peers = [peer.ip]
+            # An unconstrained end (src=any / dst=any) is a catch-all,
+            # and a catch-all exists for the traffic no other rule names.
+            # Probing it laterally is what produced a false DEAD: a
+            # member-to-member packet is legitimately decided by whatever
+            # higher-priority rule covers the internal case, so the
+            # catch-all never gets a look in and is reported as shadowed.
+            # Aim off-net instead -- the class of destination the rule is
+            # actually for. The lateral case has its own named rules and
+            # its own probes.
+            peers = [_OFFNET]
         else:
             known = {vm.ip: vm for vm in self.inv.all if vm.ip}
-            peers = self._addr_samples(far_spec, known, local.ip)
+            peers = self._addr_samples(far_spec, known, local.ip, gws)
             if not peers:
                 return [], f"could not derive an address from '{far_spec}'"
 
@@ -841,7 +886,7 @@ class ACLManager:
         return []
 
     def _addr_samples(self, blob: str, known: dict | None = None,
-                      exclude: str = "") -> list[str]:
+                      exclude: str = "", avoid: set[str] | None = None) -> list[str]:
         """Sample addresses out of an `ip4.src == {a, b, c}` operand.
 
         A range that actually contains a port is probed AT that port
@@ -861,7 +906,7 @@ class ACLManager:
                     net = None
                 if net is not None:
                     for addr in known:
-                        if addr == exclude:
+                        if addr == exclude or addr in (avoid or ()):
                             continue
                         try:
                             if ipaddress.ip_address(addr) in net:
@@ -869,7 +914,7 @@ class ACLManager:
                                 break
                         except ValueError:
                             continue
-            pick = pick or self._sample_ip(part)
+            pick = pick or self._sample_ip(part, avoid)
             if pick:
                 out.append(pick)
         return out
@@ -897,17 +942,11 @@ class ACLManager:
         addrs = {side: blob for side, blob in self._M_ADDR.findall(match)}
         if far_side in addrs:
             peers = self._addr_samples(addrs[far_side], by_ip,
-                                       locals_[0]["ip"])
+                                       locals_[0]["ip"], self._gateway_ips())
             if not peers:
                 return [], f"no usable address in ip4.{far_side}"
         else:
-            peer = next((m for m in
-                         ([ports[x] for x in self._members_of(group)
-                           if x in ports] if group else [])
-                        if m["ip"] and m["ip"] != locals_[0]["ip"]), None)
-            if peer is None:
-                return [], "unconstrained match with no peer to trace from"
-            peers = [peer["ip"]]
+            peers = [_OFFNET]
 
         # Check the endpoint here rather than letting _trace_expr find it,
         # so the message can name the port. "port has no MAC, address" sends
@@ -999,12 +1038,14 @@ class ACLManager:
                                             by_ip, lrp_mac)
                 if dp is None:
                     results.append((plabel, peer_ip, expect, "SKIP",
-                                    [], [], expr))
+                                    [], [], [], expr))
                     continue
                 out = ovn.trace(ctx, dp, expr)
+                far_side = "in" if side == "out" else "out"
                 results.append((plabel, peer_ip, expect, trace_verdict(out),
                                 trace_acl_priorities(out, side),
-                                trace_acl_priorities(out), out))
+                                trace_acl_priorities(out),
+                                trace_acl_priorities(out, far_side), out))
             self._report_case(label, want_prio, results, direction)
 
         self._report_duplicate_acls(pending, ports)
@@ -1083,12 +1124,14 @@ class ACLManager:
                     rule.direction, local, peer_ip, pexpr, by_ip, lrp_mac)
                 if datapath is None:
                     results.append((plabel, peer_ip, expect, "SKIP",
-                                    [], [], expr))
+                                    [], [], [], expr))
                     continue
                 out = ovn.trace(self.ctx, datapath, expr)
+                far_side = "in" if side == "out" else "out"
                 results.append((plabel, peer_ip, expect, trace_verdict(out),
                                 trace_acl_priorities(out, side),
-                                trace_acl_priorities(out), out))
+                                trace_acl_priorities(out),
+                                trace_acl_priorities(out, far_side), out))
             label = (f"{rule.name} ({rule.direction} {rule.priority} "
                      f"{rule.action})")
             self._report_case(label, want_prio, results, rule.direction)
@@ -1116,7 +1159,8 @@ class ACLManager:
         unmeasured = []
         skipped = []
         unreachable = []
-        for plabel, peer_ip, expect, verdict, mine, every, out in results:
+        downstream = []
+        for plabel, peer_ip, expect, verdict, mine, every, far, out in results:
             decided_here = [p for p in mine if p > 0]
             decided_any = [p for p in every if p > 0]
             if verdict == "SKIP":
@@ -1125,9 +1169,20 @@ class ACLManager:
                 unmeasured.append((plabel, peer_ip, out))
             elif want_prio >= 0 and acl_priority_matched(decided_here,
                                                          want_prio):
-                # Our rule matched. Now the verdict has to agree with it.
-                (ok if verdict == expect else bad).append(
-                    (plabel, peer_ip, verdict, expect, out))
+                # Our rule matched. Now the verdict has to agree with it --
+                # unless the disagreement came from the OTHER pipeline.
+                # An allow rule governs whether a packet may leave; the
+                # destination segment gets its own say, and a drop there
+                # is not this rule failing. Blaming it for one is how
+                # "int-vm may egress" gets reported as broken because the
+                # address it was pointed at happens to be isolated.
+                if verdict == expect:
+                    ok.append((plabel, peer_ip, verdict, expect, out))
+                elif expect == "ALLOW" and [p for p in far if p > 0]:
+                    downstream.append(
+                        (plabel, peer_ip, max(p for p in far if p > 0)))
+                else:
+                    bad.append((plabel, peer_ip, verdict, expect, out))
             elif (direction == "to-lport" and decided_any
                   and verdict == "DROP"):
                 # The egress ACLs never ran: something in the INGRESS
@@ -1160,6 +1215,11 @@ class ACLManager:
             self.v_skip += 1
             print(f"  {self.tag('skip')} {label:<46} "
                   f"{self.c.dim}{skipped[0][2]}{self.c.rst}")
+        elif downstream and not ok and not shadowed and not unreachable:
+            self.v_ok += 1
+            print(f"  {self.tag('ok')} {label:<46} {self.c.dim}"
+                  f"{len(downstream)}/{n} allowed here, dropped at the far "
+                  f"end{self.c.rst}")
         elif unreachable and not ok and not shadowed:
             self.v_skip += 1
             print(f"  {self.tag('skip')} {label:<46} {self.c.dim}"
@@ -1189,6 +1249,8 @@ class ACLManager:
                 notes.append(f"{len(skipped)} unprobeable")
             if unreachable:
                 notes.append(f"{len(unreachable)} never reached egress")
+            if downstream:
+                notes.append(f"{len(downstream)} dropped at the far end")
             extra = ", " + ", ".join(notes) if notes else ""
             print(f"  {self.tag('ok')} {label:<46} {self.c.dim}{len(ok)}/{n} probe(s){extra}{self.c.rst}")
 
