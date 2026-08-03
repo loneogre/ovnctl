@@ -483,6 +483,9 @@ acls:
     - "intvm-terrain-out  from-lport 900 drop          pg_int_vms dst=any log"
     - "intvm-terrain-in   to-lport   900 drop          pg_int_vms src=any log"
 
+    - "icmp-mgmt-in  to-lport   3000 allow-related pg_all_vms src=172.31.1.9,172.31.0.0/27 icmp"
+    - "icmp-mgmt-out from-lport 3000 allow-related pg_all_vms dst=172.31.1.9,172.31.0.0/27 icmp"
+
     # --- FreeIPA domain join: ext-vm2 (.35) -> int-vm4 (.30) ------------
     # Priority 2100 so these survive a future default-deny for lateral
     # traffic. With the current rule set they are permissive no-ops --

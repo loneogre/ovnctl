@@ -198,6 +198,12 @@ class UserVM:
                                   "172.31.0.0/27")
         self.drop_priority = c.cfg_opt("user_vms", "drop_priority", "1000")
         self.access_priority = c.cfg_opt("user_vms", "access_priority", "1100")
+        # Deliberately above every priority [acls] uses. See segment_acls.
+        self.icmp_priority = c.cfg_opt("user_vms", "icmp_priority", "3000")
+        self.icmp_sources = [r for r in
+                             c.cfg_opt("user_vms", "icmp_sources",
+                                       "172.31.1.9,172.31.0.0/27")
+                             .replace(",", " ").split() if r]
 
         # Per-protocol port overrides, e.g. [user_vms].port_http: 8080 for
         # a segment whose web services do not sit on 80. Defaults are the
@@ -207,6 +213,12 @@ class UserVM:
             for proto, default in ACCESS_PORTS.items()
         }
 
+        if self.icmp_sources and int(self.icmp_priority) <= int(self.access_priority):
+            raise Abort(
+                f"[user_vms].icmp_priority ({self.icmp_priority}) must be "
+                f"HIGHER than access_priority ({self.access_priority}).\n"
+                f"The troubleshooting ping rule only works if nothing "
+                f"outranks it; below the access rules it is decorative.")
         if int(self.access_priority) <= int(self.drop_priority):
             raise Abort(
                 f"[user_vms].access_priority ({self.access_priority}) must be "
